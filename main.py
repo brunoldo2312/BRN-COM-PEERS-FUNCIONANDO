@@ -1,12 +1,6 @@
 """
-main.py — Entrypoint unificado do no BRN (v6.2)
+main.py — Entrypoint unificado do no BRN (v6.1)
 ============================================================
-v6.2:
-  - BRN_NODE_AUTORESET=1: se a senha da identidade estiver errada,
-    renomeia para .corrompida e cria uma nova automaticamente.
-  - Leitura de auto-reset via AUTO_RESET.txt ou env var.
-  - Mensagens de erro mais descritivas.
-
 v6.1:
   - --client-mode: cliente NAO origina genesis, espera da rede.
   - Blockchain recebe auto_genesis=not args.client_mode.
@@ -21,7 +15,7 @@ v6.0 (breaking):
   - P2PManager recebe node_id_priv (handshake autenticado E2P).
   - --rotate-node-id para gerar nova identidade (backup automatico).
 
-Features:
+Features herdadas:
   --status        Diagnostico completo e sai
   --headless      Sem interface grafica
   --read-only     Nao minera, nao publica no GitHub
@@ -67,7 +61,7 @@ CLIENT_BOOT_TIMEOUT = int(os.environ.get("BRN_CLIENT_BOOT_TIMEOUT", "120"))
 # ARGUMENTOS
 # ============================================================
 def parse_args():
-    p = argparse.ArgumentParser(prog="main.py", description="BRN Node v6.2")
+    p = argparse.ArgumentParser(prog="main.py", description="BRN Node v6")
     p.add_argument("--status", action="store_true",
                    help="Diagnostico completo e sai")
     p.add_argument("--headless", action="store_true",
@@ -105,29 +99,6 @@ def parse_args():
 
 
 # ============================================================
-# v6.2: AUTO-RESET DETECTION
-# ============================================================
-def _should_auto_reset() -> bool:
-    """
-    Detecta se deve fazer auto-reset da identidade em caso de senha errada.
-
-    Ordem:
-      1. Env BRN_NODE_AUTORESET=1 (ou 0)
-      2. Se arquivo AUTO_RESET.txt existe na pasta, liga.
-      3. Padrao: desligado.
-    """
-    env = os.environ.get("BRN_NODE_AUTORESET")
-    if env is not None:
-        return env == "1"
-
-    # Se existe AUTO_RESET.txt, liga
-    if (BASE_DIR / "AUTO_RESET.txt").exists():
-        return True
-
-    return False
-
-
-# ============================================================
 # RESOLUCAO DE SENHA DO NO
 # ============================================================
 def _resolve_password(args) -> str:
@@ -135,9 +106,8 @@ def _resolve_password(args) -> str:
     Ordem:
       1. --password-file
       2. --password
-      3. BRN_NODE_PASSWORD (env)
+      3. BRN_NODE_PASSWORD
       4. prompt interativo (somente se TTY)
-      5. erro se nao-TTY
     """
     if args.password_file:
         p = Path(args.password_file)
@@ -163,85 +133,43 @@ def _resolve_password(args) -> str:
 
 
 # ============================================================
-# v6.2: IDENTIDADE Ed25519 (com auto-reset)
+# IDENTIDADE Ed25519
 # ============================================================
 def load_or_create_node_identity(password: str, rotate: bool = False):
     """
-    Carrega/cria a identidade Ed25519 do no.
-    Retorna (priv, pub_hex).
-
-    Comportamento:
-      1. rotate=True: move atual para .enc.bak, cria nova.
-      2. Existe: tenta decifrar.
-         - Sucesso: usa.
-         - Falha + auto_reset=True: move para .enc.corrompida, cria nova.
-         - Falha + auto_reset=False: crash com mensagem clara.
-      3. Nao existe: cria nova.
+    Carrega/cria a identidade Ed25519. Retorna (priv, pub_hex).
     """
     from crypto import Ed25519PrivateKey
     from secure_store import save_wallet, load_wallet
 
     log = get_logger("identity")
-    auto_reset = _should_auto_reset()
 
-    # ---- Rotacao explicita ----
     if rotate and NODE_ID_PATH.exists():
         backup = NODE_ID_PATH.with_suffix(".enc.bak")
-        # Se ja existe backup, adiciona timestamp
-        if backup.exists():
-            ts = int(time.time())
-            backup = NODE_ID_PATH.with_suffix(f".enc.bak.{ts}")
         NODE_ID_PATH.replace(backup)
         log.warning(f"Identidade rotacionada. Backup em {backup}")
 
-    # ---- Existe: tenta carregar ----
     if NODE_ID_PATH.exists():
         try:
             data = load_wallet(str(NODE_ID_PATH), password)
-            sk = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(data["sk"]))
-            pub_hex = data["pub"]
-            log.info(f"Identidade carregada: {pub_hex[:16]}...")
-            return sk, pub_hex
         except Exception as e:
-            # Senha errada ou arquivo corrompido
-            if auto_reset:
-                backup = NODE_ID_PATH.with_suffix(".enc.corrompida")
-                # Se ja existe, adiciona timestamp
-                if backup.exists():
-                    ts = int(time.time())
-                    backup = NODE_ID_PATH.with_suffix(f".enc.corrompida.{ts}")
-                NODE_ID_PATH.replace(backup)
-                log.warning(f"Senha errada ({e}).")
-                log.warning(f"Identidade movida para: {backup}")
-                log.warning("BRN_NODE_AUTORESET ligado — criando identidade NOVA")
-                log.warning("AVISO: peers antigos podem rejeitar essa pubkey nova")
-            else:
-                raise SystemExit(
-                    f"\n"
-                    f"==========================================================\n"
-                    f"  Falha ao decifrar {NODE_ID_PATH.name}\n"
-                    f"==========================================================\n"
-                    f"  Motivo: {e}\n"
-                    f"\n"
-                    f"  Opcoes:\n"
-                    f"    1. Se sabe a senha correta, ajuste BRN_NODE_PASSWORD\n"
-                    f"    2. Se NAO sabe, defina BRN_NODE_AUTORESET=1 (ou crie\n"
-                    f"       um arquivo AUTO_RESET.txt vazio nesta pasta) e\n"
-                    f"       rode de novo — a identidade sera recriada.\n"
-                    f"    3. Ou rode manualmente:\n"
-                    f"         ren node_identity.enc node_identity.enc.antiga\n"
-                    f"       e depois execute de novo.\n"
-                    f"==========================================================\n"
-                )
+            raise SystemExit(
+                f"Falha ao decifrar {NODE_ID_PATH}: {e}\n"
+                f"Senha errada? Arquivo corrompido?\n"
+                f"Use --rotate-node-id para gerar nova identidade."
+            )
+        sk = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(data["sk"]))
+        pub_hex = data["pub"]
+        log.info(f"Identidade carregada: {pub_hex[:16]}...")
+        return sk, pub_hex
 
-    # ---- Cria nova ----
     sk = Ed25519PrivateKey.generate()
     pub_hex = sk.public_key().public_bytes_raw().hex()
     save_wallet(str(NODE_ID_PATH), {
         "sk": sk.private_bytes_raw().hex(),
         "pub": pub_hex,
     }, password)
-    log.info(f"Identidade nova criada: {pub_hex[:16]}... ({NODE_ID_PATH.name})")
+    log.info(f"Identidade nova criada: {pub_hex[:16]}... ({NODE_ID_PATH})")
     return sk, pub_hex
 
 
@@ -308,7 +236,6 @@ def do_status(cfg):
     print(f"  Headless    : {cfg['headless']}")
     print(f"  Miner       : {'ON' if cfg['miner_enabled'] else 'off'}")
     print(f"  UPnP        : {'ON' if cfg['upnp'] else 'off'}")
-    print(f"  Auto-reset  : {'ON' if _should_auto_reset() else 'off'}")
     print()
     gh = cfg['github']
     tok = gh.get('token') or ""
@@ -538,7 +465,6 @@ def main():
     log.info(f"  BRN Node v{VERSION} ({BUILD_DATE})")
     log.info(f"  Config: {cfg.source}")
     log.info(f"  Modo  : {'CLIENTE (nao origina genesis)' if args.client_mode else 'ORIGEM'}")
-    log.info(f"  Auto-reset: {'ON' if _should_auto_reset() else 'off'}")
     log.info("=" * 60)
 
     if args.version:
@@ -559,11 +485,9 @@ def main():
             print(f"Falha: {r.get('error')}")
             return
         print(f"Local : {r['local']}")
-        print(f"Remoto: {r['
-
-remote']}")
+        print(f"Remoto: {r['remote']}")
         if r["update_available"]:
-            print(f"\n>>> ATUAL|IZACAO DISPONIVEL: {r['url']}")
+            print(f"\n>>> ATUALIZACAO DISPONIVEL: {r['url']}")
             if r.get("notes"):
                 print(f"Notas: {r['notes']}")
         else:

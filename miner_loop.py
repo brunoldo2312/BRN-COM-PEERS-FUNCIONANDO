@@ -1,11 +1,14 @@
 """
-miner_loop.py — Loop de mineracao do BRN (v6)
+miner_loop.py — Loop de mineracao do BRN (v6.1)
 ================================================================
 API publica:
     get_miner(chain) -> Miner    (singleton)
     Miner.start(addr, pubkey_hex)
     Miner.stop()
     Miner.status() -> dict
+
+v6.1: status() agora expoe 'count', 'last_height', 'uptime'
+      para a carteira web exibir progresso.
 ================================================================
 """
 import os
@@ -78,6 +81,9 @@ class Miner:
         self.running = False
         self.blocks_mined = 0
         self.last_error = ""
+        # v6.1: campos de progresso
+        self.last_height = None
+        self.started_at = 0.0
 
     def start(self, address, pubkey_hex=""):
         if self.running:
@@ -96,6 +102,8 @@ class Miner:
         self.pubkey = pubkey_hex
         self.blocks_mined = 0
         self.last_error = ""
+        self.last_height = None
+        self.started_at = time.time()
         self._stop_evt.clear()
         self.running = True
 
@@ -109,10 +117,16 @@ class Miner:
             return False, "nao estava rodando"
         self._stop_evt.set()
         self.running = False
-        _log("Miner parado")
+        _log(f"Miner parado (total={self.blocks_mined})")
         return True, "parado"
 
     def status(self):
+        uptime = 0
+        if self.started_at and self.running:
+            uptime = int(time.time() - self.started_at)
+        elif self.started_at and not self.running:
+            uptime = int(time.time() - self.started_at) if self.blocks_mined else 0
+
         return {
             "running": self.running,
             "address": self.address,
@@ -121,6 +135,9 @@ class Miner:
             "height": self.chain.db.height(),
             "difficulty": self.chain.current_difficulty(),
             "last_error": self.last_error,
+            "count": self.blocks_mined,
+            "last_height": self.last_height,
+            "uptime": uptime,
         }
 
     def _loop(self):
@@ -148,6 +165,7 @@ class Miner:
 
                 self.blocks_mined += 1
                 h = block.get("height")
+                self.last_height = h
                 _log(f"OK Bloco #{h} minerado (total={self.blocks_mined})")
 
             except ValueError as e:
@@ -166,7 +184,6 @@ class Miner:
         _log("Miner loop encerrado")
 
 
-# --------- auto-start (opcional) ---------
 def loop_mineracao(chain, intervalo=None):
     """Compat com chamadas antigas."""
     if not MINER_AUTO:

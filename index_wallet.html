@@ -118,6 +118,14 @@
     font-size:.82rem; color:#7ee787;
   }
   .mining-box.show { display:block; }
+
+  .badge { display:inline-block; padding:2px 8px; border-radius:10px;
+           font-size:.72rem; font-weight:600; }
+  .badge.sent     { background:#2d1416; color:#ffa198; border:1px solid #8b2424; }
+  .badge.received { background:#0d2818; color:#7ee787; border:1px solid #238636; }
+  .badge.self     { background:#2d2200; color:#e3b341; border:1px solid #9e6a03; }
+  .badge.pending  { background:#2d2200; color:#e3b341; border:1px solid #9e6a03; }
+  .badge.confirmed{ background:#0d2818; color:#7ee787; border:1px solid #238636; }
 </style>
 </head>
 <body>
@@ -154,6 +162,7 @@
     <button class="tab active" data-tab="explorer">🔍 Explorador</button>
     <button class="tab" data-tab="carteira">💼 Carteira</button>
     <button class="tab" data-tab="enviar">📤 Enviar</button>
+    <button class="tab" data-tab="verificar">🔎 Verificar</button>
     <button class="tab" data-tab="bridge">🌉 Bridge</button>
     <button class="tab" data-tab="arquivo">💾 Arquivo</button>
   </div>
@@ -242,10 +251,20 @@
     <div class="card">
       <h2>Minhas transações</h2>
       <table>
-        <thead><tr><th>TXID</th><th>Altura</th><th>Outputs</th></tr></thead>
-        <tbody id="tbodyMyTxs"><tr><td colspan="3" style="color:#8b949e;">—</td></tr></tbody>
+        <thead>
+          <tr>
+            <th>Direção</th>
+            <th>TXID</th>
+            <th>Valor (BRN)</th>
+            <th>Status</th>
+            <th>Bloco</th>
+          </tr>
+        </thead>
+        <tbody id="tbodyMyTxs">
+          <tr><td colspan="5" style="color:#8b949e;">—</td></tr>
+        </tbody>
       </table>
-      <div class="row"><button class="btn" id="bMyTxs">🔄 Carregar</button></div>
+      <div class="row"><button class="btn" id="bMyTxs">🔄 Atualizar</button></div>
     </div>
   </div>
 
@@ -281,6 +300,52 @@
         </div>
       </div>
       <div class="msg" id="mMine"></div>
+    </div>
+  </div>
+
+  <!-- ============ VERIFICAR ============ -->
+  <div class="panel" id="p-verificar">
+    <div class="card">
+      <h2>🔎 Verificar se uma transação chegou</h2>
+      <p style="color:#8b949e;font-size:.82rem;margin-bottom:8px;">
+        Cole o TXID e o endereço de destino para confirmar se a transação
+        chegou. Funciona para conferir envios e recebimentos, seu ou de outra pessoa.
+      </p>
+
+      <label>TXID da transação</label>
+      <input id="verTxid" placeholder="ex: 3f4a5b6c7d8e...">
+
+      <label>Endereço BRN de destino</label>
+      <input id="verAddr" placeholder="brn1...">
+
+      <div class="row">
+        <button class="btn p" id="bVerificar">🔎 Verificar</button>
+        <button class="btn" id="bVerificarMeu">👤 Usar meu endereço</button>
+        <button class="btn" id="bVerificarUltimo">📋 Último TX enviado</button>
+      </div>
+
+      <div class="msg" id="mVerificar"></div>
+
+      <div id="verResult" style="display:none;margin-top:14px;">
+        <div class="grid3">
+          <div class="stat"><div class="lbl">Chegou?</div><div class="val" id="vrChegou">—</div></div>
+          <div class="stat"><div class="lbl">Status</div><div class="val" id="vrStatus">—</div></div>
+          <div class="stat"><div class="lbl">Valor</div><div class="val" id="vrValor">—</div></div>
+          <div class="stat"><div class="lbl">Confirmações</div><div class="val" id="vrConf">—</div></div>
+          <div class="stat"><div class="lbl">Bloco</div><div class="val" id="vrBloco">—</div></div>
+          <div class="stat"><div class="lbl">Detalhe</div><div class="val" id="vrMsg" style="font-size:.75rem;">—</div></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Consultar status por TXID</h2>
+      <label>TXID</label>
+      <input id="txStatusId" placeholder="Cole o TXID para ver pending/confirmed">
+      <div class="row">
+        <button class="btn" id="bTxStatus">🔍 Consultar status</button>
+      </div>
+      <div class="msg" id="mTxStatus"></div>
     </div>
   </div>
 
@@ -356,7 +421,7 @@
     </div>
   </div>
 
-  <div class="footer">BRN Wallet v3.5 · ponte pywebview · <span id="apiLbl">—</span></div>
+  <div class="footer">BRN Wallet v3.6 · ponte pywebview · <span id="apiLbl">—</span></div>
 </div>
 
 <script>
@@ -368,6 +433,7 @@
 let wallet = { address:"", private_key:"", public_key:"" };
 let ready = false;
 let miningRunning = false;
+let lastSentTxid = "";
 
 // ============================================================
 // HELPERS
@@ -567,31 +633,93 @@ async function atualizarSaldo() {
   } catch (e) { msg("mCart", "❌ " + e.message, "err"); }
 }
 
+// ============================================================
+// MINHAS TRANSAÇÕES (com direção, status e confirmações)
+// ============================================================
 async function carregarMinhasTxs() {
   if (!wallet.address) return;
   const tb = $("tbodyMyTxs");
-  tb.innerHTML = '<tr><td colspan="3" style="color:#8b949e;">Carregando…</td></tr>';
+  tb.innerHTML = '<tr><td colspan="5" style="color:#8b949e;">Carregando…</td></tr>';
+
+  // tenta endpoint novo; cai para o antigo se nao existir
+  let txs = [];
+  let ok = false;
   try {
-    const r = await api("list_transactions", wallet.address);
-    if (r.erro) throw new Error(r.erro);
-    const txs = (r.transactions || []).slice().reverse();
-    if (!txs.length) {
-      tb.innerHTML = '<tr><td colspan="3" style="color:#8b949e;">Sem transações</td></tr>';
-      return;
+    const r = await api("minhas_txs", wallet.address);
+    if (r && r.ok) { txs = r.transactions || []; ok = true; }
+  } catch (e) { /* método nao exposto ou endpoint nao existe */ }
+
+  if (!ok) {
+    // fallback: endpoint antigo (só recebidas)
+    try {
+      const r = await api("list_transactions", wallet.address);
+      if (r && !r.erro) {
+        txs = (r.transactions || []).map(function(t) {
+          return {
+            txid: t.txid,
+            direction: "received",
+            amount: (t.outputs || []).reduce(function(s,o){
+              return s + (o.address === wallet.address ? o.amount : 0);
+            }, 0),
+            status: "confirmed",
+            block_height: t.block_height,
+            confirmations: null,
+            timestamp: t.timestamp || 0,
+          };
+        });
+        ok = true;
+      }
+    } catch (e) { /* nada */ }
+  }
+
+  if (!ok) {
+    tb.innerHTML = '<tr><td colspan="5" style="color:#ffa198;">Endpoint indisponivel. Reinicie o no.</td></tr>';
+    return;
+  }
+
+  if (!txs.length) {
+    tb.innerHTML = '<tr><td colspan="5" style="color:#8b949e;">Sem transações</td></tr>';
+    return;
+  }
+
+  tb.innerHTML = "";
+  for (const t of txs) {
+    const tr = document.createElement("tr");
+    const direcaoBadge = t.direction === "sent"
+      ? '<span class="badge sent">↑ Enviada</span>'
+      : t.direction === "received"
+        ? '<span class="badge received">↓ Recebida</span>'
+        : '<span class="badge self">↻ Auto</span>';
+
+    let statusBadge = "—";
+    if (t.status === "pending") {
+      statusBadge = '<span class="badge pending">⏳ mempool</span>';
+    } else if (t.status === "confirmed") {
+      const c = t.confirmations != null ? t.confirmations : "?";
+      statusBadge = '<span class="badge confirmed">✅ ' + c + ' conf</span>';
     }
-    tb.innerHTML = "";
-    for (const t of txs) {
-      const tr = document.createElement("tr");
-      const outStr = (t.outputs || []).map(function(o) {
-        return ((o.address || "").slice(0,12)) + "… +" + ((o.amount / 1e8).toFixed(4));
-      }).join("<br>");
-      tr.innerHTML = '<td><code>' + shortHash(t.txid, 18) + '</code></td>' +
-                     '<td>' + (t.block_height != null ? t.block_height : "—") + '</td>' +
-                     '<td>' + (outStr || "—") + '</td>';
-      tb.appendChild(tr);
-    }
-  } catch (e) {
-    tb.innerHTML = '<tr><td colspan="3" style="color:#ffa198;">' + e.message + '</td></tr>';
+
+    const bloco = t.block_height != null ? "#" + t.block_height : "—";
+    const valor = ((t.amount || 0) / 1e8).toFixed(8);
+
+    tr.innerHTML = '<td>' + direcaoBadge + '</td>' +
+      '<td><code title="' + t.txid + '">' + shortHash(t.txid, 18) + '</code></td>' +
+      '<td>' + valor + '</td>' +
+      '<td>' + statusBadge + '</td>' +
+      '<td>' + bloco + '</td>';
+
+    tr.title = "Clique para verificar";
+    tr.onclick = function() {
+      $("verTxid").value = t.txid;
+      $("verAddr").value = wallet.address;
+      // troca aba
+      document.querySelectorAll(".tab").forEach(function(x){x.classList.remove("active")});
+      document.querySelectorAll(".panel").forEach(function(x){x.classList.remove("active")});
+      document.querySelector('.tab[data-tab="verificar"]').classList.add("active");
+      $("p-verificar").classList.add("active");
+      verificarTx();
+    };
+    tb.appendChild(tr);
   }
 }
 
@@ -614,7 +742,11 @@ async function enviar() {
       wallet.address, to, "BRN", amt,
       wallet.private_key, wallet.public_key);
     if (r.ok) {
-      msg("mEnviar", "✅ Aceita na mempool. TXID: " + shortHash(r.txid, 20), "ok", 6000);
+      lastSentTxid = r.txid || "";
+      msg("mEnviar",
+          "✅ Aceita na mempool. TXID: " + shortHash(r.txid, 20) +
+          " — veja em 🔎 Verificar",
+          "ok", 8000);
       $("txTo").value = ""; $("txAmount").value = "";
       await atualizarSaldo();
       await carregarMinhasTxs();
@@ -629,7 +761,7 @@ async function enviar() {
 }
 
 // ============================================================
-// MINERAÇÃO TOGGLE (iniciar / parar)
+// MINERAÇÃO TOGGLE
 // ============================================================
 async function minerar() {
   clearMsg("mMine");
@@ -639,7 +771,6 @@ async function minerar() {
   btn.disabled = true;
 
   if (miningRunning) {
-    // ============ PARAR ============
     btn.innerHTML = '<span class="spin"></span>Parando…';
     try {
       const r = await api("stop_mining");
@@ -652,7 +783,6 @@ async function minerar() {
       await updateMiningUI();
     }
   } else {
-    // ============ INICIAR ============
     btn.innerHTML = '<span class="spin"></span>Iniciando…';
     try {
       const r = await api("start_mining", wallet.address);
@@ -710,6 +840,76 @@ async function faucet() {
       msg("mMine", "❌ " + (r.msg || "falha"), "err");
     }
   } catch (e) { msg("mMine", "❌ " + e.message, "err"); }
+}
+
+// ============================================================
+// VERIFICAÇÃO DE TRANSAÇÃO
+// ============================================================
+async function verificarTx() {
+  clearMsg("mVerificar");
+  $("verResult").style.display = "none";
+
+  const txid = $("verTxid").value.trim();
+  const addr = $("verAddr").value.trim();
+  if (!txid) { msg("mVerificar", "❌ Cole o TXID.", "err"); return; }
+  if (!addr) { msg("mVerificar", "❌ Informe o endereço BRN.", "err"); return; }
+
+  const btn = $("bVerificar");
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spin"></span>Verificando…';
+  try {
+    const r = await api("verificar_recebimento", addr, txid);
+    if (!r.ok) throw new Error(r.msg || "falha");
+
+    $("verResult").style.display = "block";
+    $("vrChegou").textContent = r.chegou ? "✅ SIM" : "❌ NÃO";
+    $("vrChegou").style.color = r.chegou ? "#7ee787" : "#ffa198";
+    $("vrStatus").textContent = r.status || "—";
+    $("vrValor").textContent  = r.valor ? fmtBRN(r.valor / 1e8) : "0 BRN";
+    $("vrConf").textContent   = r.confirmacoes != null ? r.confirmacoes : "—";
+    $("vrBloco").textContent  = r.block_height != null ? "#" + r.block_height : "—";
+    $("vrMsg").textContent    = r.msg || "—";
+
+    if (r.chegou) {
+      msg("mVerificar",
+          "✅ CHEGOU! " + fmtBRN(r.valor / 1e8) +
+          " · " + r.status + " · " + (r.confirmacoes || 0) + " confirmações",
+          "ok", 8000);
+    } else {
+      const tipo = r.status === "pending" ? "info" : "err";
+      msg("mVerificar",
+          "❌ Não chegou ainda · status: " + r.status,
+          tipo, 8000);
+    }
+  } catch (e) {
+    msg("mVerificar", "❌ " + e.message, "err");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "🔎 Verificar";
+  }
+}
+
+async function consultarTxStatus() {
+  clearMsg("mTxStatus");
+  const txid = $("txStatusId").value.trim();
+  if (!txid) { msg("mTxStatus", "❌ Cole o TXID.", "err"); return; }
+  const btn = $("bTxStatus");
+  btn.disabled = true;
+  try {
+    const r = await api("tx_status", txid);
+    if (!r.ok) throw new Error(r.msg || "falha");
+    let txt = "Status: " + r.status;
+    if (r.status === "confirmed") {
+      txt += " · bloco #" + r.block_height + " · " + r.confirmations + " confirmações";
+    } else if (r.status === "pending") {
+      txt += " · aguardando mineração";
+    }
+    msg("mTxStatus", txt, r.status === "confirmed" ? "ok" : (r.status === "pending" ? "info" : "err"), 8000);
+  } catch (e) {
+    msg("mTxStatus", "❌ " + e.message, "err");
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 // ============================================================
@@ -834,6 +1034,24 @@ function configEventos() {
   $("bEnviar").onclick     = enviar;
   $("bMinerar").onclick    = minerar;
   $("bFaucet").onclick     = faucet;
+  $("bVerificar").onclick  = verificarTx;
+  $("bVerificarMeu").onclick = function() {
+    if (wallet.address) {
+      $("verAddr").value = wallet.address;
+      msg("mVerificar", "Endereço do usuário preenchido.", "info", 3000);
+    } else {
+      msg("mVerificar", "❌ Sem carteira carregada.", "err");
+    }
+  };
+  $("bVerificarUltimo").onclick = function() {
+    if (lastSentTxid) {
+      $("verTxid").value = lastSentTxid;
+      msg("mVerificar", "Último TXID preenchido.", "info", 3000);
+    } else {
+      msg("mVerificar", "Nenhum TX enviado nesta sessão.", "info", 4000);
+    }
+  };
+  $("bTxStatus").onclick   = consultarTxStatus;
   $("bBridgeRefresh").onclick = bridgeRefresh;
   $("bBridgeClaim").onclick   = bridgeClaim;
   $("bSalvar").onclick     = salvar;
@@ -858,7 +1076,6 @@ async function boot() {
   configEventos();
   $("apiLbl").textContent = "127.0.0.1:5000 · 8080";
 
-  // 1) restaura carteira ativa
   try {
     const w = await api("get_active_wallet");
     if (w.ok && w.address) {
@@ -873,14 +1090,12 @@ async function boot() {
     }
   } catch (e) { /* primeira vez */ }
 
-  // 2) status iniciais
   await refreshStatus();
   await carregarBlocos();
   await listarWallets();
   await refreshSyncInfo();
   await updateMiningUI();
 
-  // 3) loops
   setInterval(refreshStatus,     10000);
   setInterval(refreshSyncInfo,    6000);
   setInterval(carregarBlocos,    20000);
@@ -889,11 +1104,7 @@ async function boot() {
 }
 
 window.addEventListener("pywebviewready", boot);
-
-// Fallback
-if (window.pywebview && window.pywebview.api) {
-  boot();
-}
+if (window.pywebview && window.pywebview.api) { boot(); }
 </script>
 </body>
 </html>

@@ -370,7 +370,32 @@ class ChainDB:
     def ultimos_eventos(self, n=50):
         rows = self.conn.execute("SELECT * FROM network_events ORDER BY id DESC LIMIT ?", (n,)).fetchall()
         return [dict(r) for r in rows]
+    # ==================== LISTAGENS PARA API ====================
+    def list_transactions(self, limit=50, offset=0):
+        """Txs recentes (incluidas em blocos). Ordem: mais recentes primeiro."""
+        rows = self.conn.execute(
+            "SELECT txid, block_height FROM transactions "
+            "ORDER BY block_height DESC LIMIT ? OFFSET ?",
+            (limit, offset)
+        ).fetchall()
+        return [dict(r) for r in rows]
 
+    def list_blocks(self, limit=50, offset=0):
+        """Headers dos blocos mais recentes. Ordem: mais recente primeiro."""
+        top = self.height()
+        if top < 0:
+            return []
+        start = max(0, top - limit - offset + 1)
+        end = top - offset + 1
+        if end <= start:
+            return []
+        rows = self.conn.execute(
+            "SELECT height, hash, prev_hash, timestamp, nonce, merkle, difficulty "
+            "FROM blocks WHERE height >= ? AND height < ? "
+            "ORDER BY height DESC LIMIT ?",
+            (start, end, limit)
+        ).fetchall()
+        return [dict(r) for r in rows]
     # ==================== CLOSE ====================
     def close(self):
         self.conn.close()
