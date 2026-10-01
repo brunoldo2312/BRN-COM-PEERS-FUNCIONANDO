@@ -1,3 +1,5 @@
+ Sobre o BRN_NETWORK_SECRET
+Você tinha minha-frase-secreta-brn-2026-muito-longa. Eu troquei por brunocoin-lan-2026
 brunocoin-lan-2026
 set BRN_WEB_PASS=senha-da-carteira-2026
 ┌─────────────────────────────────────────────────────┐
