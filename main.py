@@ -137,12 +137,14 @@ def _resolve_password(args) -> str:
 # ============================================================
 def load_or_create_node_identity(password: str, rotate: bool = False):
     """
-    Carrega/cria a identidade Ed25519. Retorna (priv, pub_hex).
+    Carrega/cria identidade Ed25519.
+    Se a senha estiver errada E BRN_NODE_AUTORESET=1, cria uma nova.
     """
     from crypto import Ed25519PrivateKey
     from secure_store import save_wallet, load_wallet
 
     log = get_logger("identity")
+    auto_reset = os.environ.get("BRN_NODE_AUTORESET", "0") == "1"
 
     if rotate and NODE_ID_PATH.exists():
         backup = NODE_ID_PATH.with_suffix(".enc.bak")
@@ -152,17 +154,24 @@ def load_or_create_node_identity(password: str, rotate: bool = False):
     if NODE_ID_PATH.exists():
         try:
             data = load_wallet(str(NODE_ID_PATH), password)
+            sk = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(data["sk"]))
+            pub_hex = data["pub"]
+            log.info(f"Identidade carregada: {pub_hex[:16]}...")
+            return sk, pub_hex
         except Exception as e:
-            raise SystemExit(
-                f"Falha ao decifrar {NODE_ID_PATH}: {e}\n"
-                f"Senha errada? Arquivo corrompido?\n"
-                f"Use --rotate-node-id para gerar nova identidade."
-            )
-        sk = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(data["sk"]))
-        pub_hex = data["pub"]
-        log.info(f"Identidade carregada: {pub_hex[:16]}...")
-        return sk, pub_hex
+            if auto_reset:
+                backup = NODE_ID_PATH.with_suffix(".enc.corrompida")
+                NODE_ID_PATH.replace(backup)
+                log.warning(f"Senha errada. Identidade movida para {backup}")
+                log.warning("Criando identidade NOVA...")
+            else:
+                raise SystemExit(
+                    f"Falha ao decifrar {NODE_ID_PATH}: {e}\n"
+                    f"Dica: defina BRN_NODE_AUTORESET=1 para criar nova "
+                    f"automaticamente, ou apague o arquivo manualmente."
+                )
 
+    # Cria nova
     sk = Ed25519PrivateKey.generate()
     pub_hex = sk.public_key().public_bytes_raw().hex()
     save_wallet(str(NODE_ID_PATH), {
@@ -171,8 +180,6 @@ def load_or_create_node_identity(password: str, rotate: bool = False):
     }, password)
     log.info(f"Identidade nova criada: {pub_hex[:16]}... ({NODE_ID_PATH})")
     return sk, pub_hex
-
-
 # ============================================================
 # VERSION CHECK
 # ============================================================
