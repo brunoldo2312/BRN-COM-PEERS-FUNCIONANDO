@@ -1,3 +1,10 @@
+Como usar:
+1.   pip install bitcoinlib
+2.   Preencha só 2 campos no código:
+    ENDERECO_DESTINO = endereço que vai receber
+    SEED_EXISTENTE = se você já tem (se não, deixa vazio que ele cria)
+
+
 Python com bitcoinlib:
 from bitcoinlib.wallets import Wallet
 w = Wallet.create('minha_carteira', network='bitcoin')
