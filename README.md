@@ -1,4 +1,4 @@
-
+brunocoin-lan-2026
 set BRN_WEB_PASS=senha-da-carteira-2026
 ┌─────────────────────────────────────────────────────┐
 │ 1️⃣ Ao iniciar o programa                             │
