@@ -4,15 +4,7 @@ setlocal EnableDelayedExpansion
 cd /d "%~dp0"
 
 REM ============================================================
-REM   BRN Node - HUB CENTRAL
-REM   ============================================
-REM   IMPORTANTE:
-REM     - Se voce LEMBRA a senha usada quando criou a
-REM       node_identity.enc, coloque ela em BRN_NODE_PASSWORD.
-REM     - Se NAO lembra, deixe como esta e APAGUE o arquivo
-REM       node_identity.enc antes de rodar.
-REM     - Com BRN_NODE_AUTORESET=1, se a senha estiver errada
-REM       o main.py renomeia para .corrompida e cria uma nova.
+REM   BRN Node - HUB CENTRAL (OTIMIZADO)
 REM ============================================================
 
 echo ============================================================
@@ -26,7 +18,7 @@ REM ============================================================
 set "BRN_NODE_PASSWORD=senha-da-carteira-2026"
 set "BRN_WEB_PASS=senha-da-carteira-2026"
 
-REM === Auto-reset em caso de senha errada ===
+REM === Auto-reset (requer main.py hibrido) ===
 set "BRN_NODE_AUTORESET=1"
 
 REM ============================================================
@@ -36,19 +28,40 @@ set "BRN_NETWORK_SECRET=brunocoin-lan-2026"
 set "BRN_TRACKER=https://brn-tracker.onrender.com"
 set "BRN_BOOTSTRAP_PEERS=177.82.132.98:6001"
 
-REM === Mineracao ===
+REM ============================================================
+REM  MINERACAO
+REM ============================================================
 set "BRN_MINER_AUTO=1"
 set "BRN_MINER_INTERVAL=30"
+set "BRN_ALLOW_SOLO_MINING=1"
+set "BRN_MIN_PEER_STABLE=10"
 
-REM === Rede / UPnP ===
+REM ============================================================
+REM  REDE / UPNP / AUTH
+REM ============================================================
 set "BRN_UPNP=1"
 set "BRN_P2P_AUTH=optional"
 
-REM === Portas ===
+REM ============================================================
+REM  PORTAS
+REM ============================================================
 set "BRN_WEB_PORT=5000"
 set "BRN_EXPLORER_PORT=8080"
 set "BRN_P2P_PORT=6001"
 
+REM ============================================================
+REM  >>>  SYNC OTIMIZADO <<<
+REM ============================================================
+set "BRN_SYNC_BATCH=500"
+set "BRN_SYNC_PARALELO_MIN=500"
+set "BRN_SYNC_PARALELO_WORKERS=4"
+set "BRN_SYNC_RETRY_MAX=5"
+set "BRN_TCP_TIMEOUT=30.0"
+
+REM ============================================================
+REM  LOG
+REM ============================================================
+set "BRN_LOG_LEVEL=INFO"
 set "PYTHONUNBUFFERED=1"
 
 REM ============================================================
@@ -93,7 +106,7 @@ echo [ok] Arquivos essenciais presentes
 echo.
 
 REM ============================================================
-REM  4) VERIFICA / AVISA SOBRE IDENTIDADE
+REM  4) IDENTIDADE
 REM ============================================================
 if exist node_identity.enc (
     echo [i] node_identity.enc JA EXISTE
@@ -136,7 +149,7 @@ if errorlevel 1 (
 echo.
 
 REM ============================================================
-REM  7) VERIFICA pywebview
+REM  7) pywebview
 REM ============================================================
 set "HEADLESS_FLAG="
 python -c "import webview" 2>nul
@@ -157,18 +170,19 @@ echo ============================================================
 echo   Modo       : HUB
 echo   Secret rede: !BRN_NETWORK_SECRET!
 echo   Node pass  : !BRN_NODE_PASSWORD!
-echo   Web pass   : !BRN_WEB_PASS!
 echo   Auto-reset : !BRN_NODE_AUTORESET!
 echo   Tracker    : !BRN_TRACKER!
 echo   Bootstrap  : !BRN_BOOTSTRAP_PEERS!
 echo   Mineracao  : !BRN_MINER_AUTO! ^(intervalo !BRN_MINER_INTERVAL!s^)
+echo   Solo mining: !BRN_ALLOW_SOLO_MINING!
+echo   Sync batch : !BRN_SYNC_BATCH!
+echo   Sync paral.: !BRN_SYNC_PARALELO_MIN! ^(workers !BRN_SYNC_PARALELO_WORKERS!^)
 echo   P2P porta  : !BRN_P2P_PORT!
 echo   HTTP       : http://127.0.0.1:!BRN_WEB_PORT!
 echo   Explorer   : http://127.0.0.1:!BRN_EXPLORER_PORT!
 echo ============================================================
 echo.
 echo   ATENCAO: deixe esta janela ABERTA enquanto o hub roda.
-echo   Feche = todos os peers perdem conexao com voce.
 echo.
 
 REM ============================================================
