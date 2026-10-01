@@ -1,0 +1,11 @@
+# pseudo-código pra sua L1
+def watch_btc_deposit(btc_address, expected_sats):
+    tx = mempool_api.get_tx(btc_address)
+    if tx.confirmations >= 3 and tx.amount >= expected_sats:
+        # assina com sua chave Ed25519 de validador
+        blockchain.submit_proof(
+            escrow_id="#1234",
+            btc_txid=tx.txid,
+            action="RELEASE_BRN"
+        )
+        return True
