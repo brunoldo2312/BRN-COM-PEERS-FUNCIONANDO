@@ -1,6 +1,11 @@
-"""
+﻿"""
 blockchain.py — Núcleo da Blockchain BRN
-Versão: 7.1.1 | Data: 01/10/2026
+Versão: 7.1.2 | Data: 01/10/2026
+
+Changelog v7.1.2:
+- [PERF] mine_block_interruptible: time.sleep(0) a cada 10k iterações
+  libera o GIL para o Flask responder. Sem isto, o /api/status bloqueia
+  durante a mineração e a carteira recebe TIMEOUT.
 
 Changelog v7.1.1 (SEGURANÇA):
 - [FIX SEGURO] validate_tx: UTXOs com pubkey vazia/zeros (coinbases
@@ -319,9 +324,6 @@ class Blockchain:
             # FIX SEGURO v7.1.1:
             # - UTXO com pubkey real (v6.0+)  → match EXATO
             # - UTXO sem pubkey (coinbase antiga) → valida pelo ENDEREÇO
-            #   deriva hash160(pubkey_do_input) e compara com u["address"]
-            #   Isto é criptograficamente seguro:
-            #   forjar pubkey com hash160 específico = quebrar SHA256+RIPEMD160
             # ============================================================
             _stored_pk = (u["pubkey"] or "").strip()
             if _stored_pk and set(_stored_pk) != {"0"}:
@@ -331,7 +333,6 @@ class Blockchain:
                         f"utxo={_stored_pk[:16]}"
                     )
             else:
-                # UTXO antiga sem pubkey — valida via endereço
                 try:
                     from bech32 import address_from_pubkey
                     derived = address_from_pubkey(bytes.fromhex(inp["pubkey"]))
@@ -540,6 +541,9 @@ class Blockchain:
             nonce += 1
             if nonce % 50000 == 0:
                 ts = int(time.time())
+            # v7.1.2: libera o GIL a cada 10k iteracoes para o Flask responder
+            if nonce % 10000 == 0:
+                time.sleep(0)
         block = {"height": height, "hash": h, "prev_hash": prev_hash,
                  "timestamp": ts, "nonce": nonce, "merkle": merkle,
                  "difficulty": diff, "transactions": txs}
