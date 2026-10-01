@@ -1,799 +1,361 @@
-"""server.py — Backend HTTP do no BRN (v8.3.2 - com miner control)"""
-from flask import Flask, request, jsonify
-from flask_cors import CORS
+"""
+server.py — API HTTP da BRN Chain v8.1 L2 MINERADO
+
+- Endpoints BRN originais: /api/status, /api/balance, /api/tx, /api/blocks
+- Endpoints L2 novos: /api/l2/quote, /api/l2/create, /api/l2/order/<id>, /api/l2/stats, /api/l2/list
+- Validação por mineração: L2 só libera após bloco minerado
+"""
+
 import os
 import time
 import json
-import threading
-from functools import wraps
-from pathlib import Path
+from flask import Flask, request, jsonify, send_from_directory
+from flask_cors import CORS
 
-from wallet import Wallet, WalletManager, HDWalletManager
-from blockchain import Blockchain, make_coinbase, txid as calc_txid, signing_hash
+from db import ChainDB
+from blockchain import Blockchain, txid, GENESIS_ADDRESS
+import btc_config
+
+# L2
+try:
+    from l2_manager import L2Manager
+    L2_ENABLED = True
+except ImportError:
+    L2_ENABLED = False
+    L2Manager = None
+
+# Config
+DB_PATH = os.environ.get("BRN_DB_PATH", "brn_v2_chain.db")
+WEB_PORT = int(os.environ.get("BRN_WEB_PORT", "5000"))
 
 app = Flask(__name__)
 CORS(app)
 
-# v7: auto_genesis=False — quem decide criar genesis e o main.py.
-# Aqui o server so consome o DB que ja foi criado/sincronizado.
-CHAIN = Blockchain("brn_v2_chain.db", auto_genesis=False)
-WALLETS_FILE = "user_wallets.json"
-CURRENT_WALLET_FILE = "current_wallet.json"
+# DB e Chain - lazy load pra não quebrar no import
+db = None
+chain = None
+l2_mgr = None
 
-FAUCET_AMOUNT_BRN = 10
-FAUCET_MAX_PER_ADDRESS = 3
-FAUCET_COOLDOWN_S = 60 * 60
-_faucet_history = {}
-
-RATE_LIMIT = 30
-RATE_WINDOW_S = 60
-_ip_history = {}
-_rate_lock = threading.Lock()
-
-_cache_saldos = {}
-_cache_lock = threading.Lock()
-CACHE_TTL_S = 5
-
-# ---- v8.3.2: miner control ----
-_miner_instance = None
-_miner_lock = threading.Lock()
-
-
-# ============================================================
-# v7: RESOLVER PUBKEY DO MINERADOR
-# ============================================================
-def _resolve_miner_pubkey(addr: str, payload_pubkey: str = "") -> str:
-    """
-    Descobre a pubkey para minerar.
-    Ordem:
-      1. Payload (se enviado)
-      2. current_wallet.json (se o address bater)
-      3. DB (UTXOs do endereco)
-    """
-    if payload_pubkey:
-        return payload_pubkey
-
-    try:
-        p = Path(__file__).parent / CURRENT_WALLET_FILE
-        if p.exists():
-            with open(p, encoding="utf-8") as f:
-                cw = json.load(f)
-            if cw.get("address") == addr:
-                pk = cw.get("pubkey") or cw.get("public_key") or ""
-                if pk:
-                    return pk
-    except Exception:
-        pass
-
-    try:
-        if hasattr(CHAIN.db, "get_pubkey_for_address"):
-            pk = CHAIN.db.get_pubkey_for_address(addr)
-            if pk:
-                return pk
-    except Exception:
-        pass
-    try:
-        row = CHAIN.db.conn.execute(
-            "SELECT pubkey FROM utxos WHERE address=? AND pubkey != '' LIMIT 1",
-            (addr,)
-        ).fetchone()
-        if row and row[0]:
-            return row[0]
-    except Exception:
-        pass
-
-    return ""
-
-
-# ============================================================
-# HELPERS
-# ============================================================
-def _rate_limit(f):
-    @wraps(f)
-    def wrapper(*args, **kwargs):
-        ip = request.remote_addr or "?"
-        agora = time.time()
-        with _rate_lock:
-            hist = _ip_history.setdefault(ip, [])
-            hist[:] = [t for t in hist if agora - t < RATE_WINDOW_S]
-            if len(hist) >= RATE_LIMIT:
-                return jsonify({"success": False,
-                                "error": "Muitas requisicoes."}), 429
-            hist.append(agora)
-        return f(*args, **kwargs)
-    return wrapper
-
-
-def _saldo_cache_get(addr):
-    with _cache_lock:
-        if addr in _cache_saldos:
-            ts, val = _cache_saldos[addr]
-            if time.time() - ts < CACHE_TTL_S:
-                return val
-    return None
-
-
-def _saldo_cache_set(addr, val):
-    with _cache_lock:
-        _cache_saldos[addr] = (time.time(), val)
-
-
-def _saldo_cache_invalidate(addr):
-    with _cache_lock:
-        _cache_saldos.pop(addr, None)
-
-
-def carregar_wallets():
-    if not os.path.exists(WALLETS_FILE):
-        return {}
-    try:
-        with open(WALLETS_FILE) as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-def salvar_wallets(w):
-    with open(WALLETS_FILE, "w") as f:
-        json.dump(w, f, indent=2)
-
-
-# ============================================================
-# CARTEIRA
-# ============================================================
-@app.route("/api/nova-carteira", methods=["POST"])
-@_rate_limit
-def nova_carteira():
-    try:
-        w = Wallet()
-        dados = {
-            "success": True,
-            "address": w.address,
-            "private_key": w.priv_hex,
-            "public_key": w.pub_hex,
-            "warning": "Guarde a chave privada."
-        }
-        wallets = carregar_wallets()
-        wallets[w.address] = {"public_key": w.pub_hex}
-        salvar_wallets(wallets)
-        return jsonify(dados)
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
-
-
-# ============================================================
-# SALDO / PORTFOLIO
-# ============================================================
-@app.route("/api/saldo/<address>", methods=["GET"])
-def saldo(address):
-    try:
-        cached = _saldo_cache_get(address)
-        if cached is None:
-            utxos = CHAIN.db.get_utxos(address)
-            cached = sum(u["amount"] for u in utxos)
-            _saldo_cache_set(address, cached)
-        return jsonify({
-            "success": True, "address": address,
-            "balance_sats": cached, "balance_brn": cached / 10**8,
-        })
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
-
-
-@app.route("/api/portfolio/<address>", methods=["GET"])
-def portfolio(address):
-    try:
-        cached = _saldo_cache_get(address)
-        if cached is None:
-            utxos = CHAIN.db.get_utxos(address)
-            cached = sum(u["amount"] for u in utxos)
-            _saldo_cache_set(address, cached)
-        return jsonify({"portfolio": {"BRN": cached / 10**8, "KYC": 0}})
-    except Exception as e:
-        return jsonify({"portfolio": {}, "error": str(e)}), 500
-
-
-# ============================================================
-# TRANSACOES
-# ============================================================
-@app.route("/api/transacoes/<address>", methods=["GET"])
-def transacoes(address):
-    try:
-        txs = []
-        for h in range(CHAIN.db.height() + 1):
-            block = CHAIN.db.get_block(h)
-            if not block:
-                continue
-            for tx in block["transactions"]:
-                if any(o.get("address") == address for o in tx["outputs"]):
-                    txs.append({
-                        "txid": tx["txid"],
-                        "block_height": h,
-                        "timestamp": tx.get("timestamp", 0),
-                        "outputs": tx["outputs"],
-                    })
-        return jsonify({"success": True, "address": address,
-                        "count": len(txs), "transactions": txs[-50:]})
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
-
-
-@app.route("/api/transfer", methods=["POST"])
-@_rate_limit
-def transfer():
-    try:
-        data = request.get_json(force=True) or {}
-        sender = data.get("from", "").strip()
-        to = data.get("to", "").strip()
-        asset_id = data.get("asset_id", "BRN")
-        amount = data.get("amount")
-        sk = data.get("private_key", "")
-        pk = data.get("public_key", "")
-
-        if asset_id != "BRN":
-            return jsonify({"ok": False, "msg": "So BRN."}), 400
-        if not WalletManager.validate_address(sender):
-            return jsonify({"ok": False, "msg": "Remetente invalido."}), 400
-        if not WalletManager.validate_address(to):
-            return jsonify({"ok": False, "msg": "Destinatario invalido."}), 400
-        if sender == to:
-            return jsonify({"ok": False, "msg": "Nao pode enviar para si."}), 400
-
-        try:
-            amount_sats = int(float(amount) * 10**8)
-        except (ValueError, TypeError):
-            return jsonify({"ok": False, "msg": "Valor invalido."}), 400
-        if amount_sats <= 0:
-            return jsonify({"ok": False, "msg": "Valor deve ser > 0."}), 400
-
-        try:
-            w = Wallet(private_key_hex=sk)
-        except Exception:
-            return jsonify({"ok": False, "msg": "Chave privada invalida."}), 400
-        if w.address != sender:
-            return jsonify({"ok": False, "msg": "Chave privada nao corresponde."}), 400
-
-        utxos = CHAIN.db.get_utxos(sender)
-        utxos.sort(key=lambda u: u["amount"], reverse=True)
-        total, escolhidos = 0, []
-        for u in utxos:
-            escolhidos.append(u)
-            total += u["amount"]
-            if total >= amount_sats + 1000:
-                break
-        if total < amount_sats:
-            return jsonify({"ok": False,
-                            "msg": f"Saldo insuficiente ({total/1e8:.8f} BRN)."}), 400
-
-        FEE = 1000
-        troco = total - amount_sats - FEE
-        dest_pk = ""
-        try:
-            if hasattr(CHAIN.db, "get_pubkey_for_address"):
-                dest_pk = CHAIN.db.get_pubkey_for_address(to) or ""
-            if not dest_pk:
-                row = CHAIN.db.conn.execute(
-                    "SELECT pubkey FROM utxos WHERE address=? AND pubkey != '' LIMIT 1",
-                    (to,)
-                ).fetchone()
-                if row and row[0]:
-                    dest_pk = row[0]
-        except Exception:
-            pass
-
-        outputs = [{"address": to, "amount": amount_sats, "pubkey": dest_pk}]
-        if troco > 0:
-            outputs.append({"address": sender, "amount": troco,
-                            "pubkey": w.pub_hex})
-
-        inputs = [{"txid": u["txid"], "vout": u["vout"],
-                   "pubkey": w.pub_hex, "signature": ""} for u in escolhidos]
-
-        nonce = CHAIN.db.get_nonce_for_pubkey(w.pub_hex)
-        tx = {"txid": "", "inputs": inputs, "outputs": outputs,
-              "timestamp": int(time.time()), "locktime": 0, "nonce": nonce}
-
-        h = signing_hash(tx)
-        for inp in tx["inputs"]:
-            inp["signature"] = w.sign(h)
-        tx["txid"] = calc_txid(tx)
-
-        ok, msg = CHAIN.submit_tx(tx)
-        if not ok:
-            return jsonify({"ok": False, "msg": msg}), 400
-
-        _saldo_cache_invalidate(sender)
-        _saldo_cache_invalidate(to)
-        return jsonify({"ok": True, "txid": tx["txid"], "nonce": nonce,
-                        "msg": "Aceita na mempool."})
-    except Exception as e:
-        return jsonify({"ok": False, "msg": str(e)}), 500
-
-
-# ============================================================
-# MINERACAO (manual - 1 bloco)
-# ============================================================
-@app.route("/api/mine", methods=["POST"])
-@_rate_limit
-def mine():
-    try:
-        data = request.get_json(force=True) or {}
-        miner = (data.get("validator_address") or data.get("address") or "").strip()
-        payload_pk = (data.get("validator_pubkey") or data.get("pubkey") or "").strip()
-
-        if not WalletManager.validate_address(miner):
-            return jsonify({"ok": False, "msg": "Endereco invalido."}), 400
-
-        pubkey = _resolve_miner_pubkey(miner, payload_pk)
-        if not pubkey:
-            return jsonify({
-                "ok": False,
-                "msg": (f"pubkey desconhecida para {miner}. "
-                        f"Envie 'validator_pubkey' no payload ou garanta "
-                        f"que a carteira tenha sido salva.")
-            }), 400
-
-        block = CHAIN.mine_block(miner, pubkey)
-        if not block:
-            return jsonify({"ok": False, "msg": "Falha."}), 500
-        _saldo_cache_invalidate(miner)
-        return jsonify({"ok": True,
-                        "msg": "Bloco minerado!",
-                        "block": {"height": block["height"], "hash": block["hash"],
-                                  "txs": len(block["transactions"]),
-                                  "difficulty": block["difficulty"],
-                                  "nonce": block["nonce"]}})
-    except Exception as e:
-        return jsonify({"ok": False, "msg": str(e)}), 500
-
-
-# ============================================================
-# v8.3.2: MINER LOOP (start/stop/status)
-# ============================================================
-def _get_miner():
-    """Retorna a instância única do miner (singleton)."""
-    global _miner_instance
-    with _miner_lock:
-        if _miner_instance is None:
+def get_db():
+    global db, chain, l2_mgr
+    if db is None:
+        db = ChainDB(DB_PATH)
+        chain = Blockchain(DB_PATH)
+        if L2_ENABLED:
             try:
-                from miner_loop import get_miner
-                _miner_instance = get_miner(CHAIN)
+                l2_mgr = L2Manager(db, chain)
             except Exception as e:
-                print(f"[Miner] Falha ao carregar miner_loop: {e}")
-                _miner_instance = None
-        return _miner_instance
-
-
-@app.route("/api/miner/start", methods=["POST"])
-@_rate_limit
-def miner_start():
-    try:
-        miner = _get_miner()
-        if miner is None:
-            return jsonify({"ok": False,
-                            "msg": "miner_loop.py indisponivel"}), 500
-
-        data = request.get_json(force=True) or {}
-        addr = (data.get("validator_address") or data.get("address") or "").strip()
-        payload_pk = (data.get("validator_pubkey") or data.get("pubkey") or "").strip()
-
-        if not WalletManager.validate_address(addr):
-            return jsonify({"ok": False, "msg": "Endereco invalido."}), 400
-
-        pk = _resolve_miner_pubkey(addr, payload_pk)
-        if not pk:
-            return jsonify({
-                "ok": False,
-                "msg": (f"pubkey desconhecida para {addr}. "
-                        f"Envie 'validator_pubkey' ou salve a carteira primeiro.")
-            }), 400
-
-        miner.start(addr, pk)
-        return jsonify({"ok": True, "msg": "Mineracao iniciada",
-                        "address": addr})
-    except Exception as e:
-        return jsonify({"ok": False, "msg": str(e)}), 500
-
-
-@app.route("/api/miner/stop", methods=["POST"])
-def miner_stop():
-    try:
-        miner = _get_miner()
-        if miner is None:
-            return jsonify({"ok": True, "count": 0})
-        count = 0
-        try:
-            st = miner.status()
-            count = st.get("count", 0)
-        except Exception:
-            pass
-        miner.stop()
-        return jsonify({"ok": True, "count": count})
-    except Exception as e:
-        return jsonify({"ok": False, "msg": str(e)}), 500
-
-
-@app.route("/api/miner/status", methods=["GET"])
-def miner_status():
-    try:
-        miner = _get_miner()
-        if miner is None:
-            return jsonify({"ok": True, "running": False, "count": 0})
-        st = miner.status()
-        st["ok"] = True
-        return jsonify(st)
-    except Exception as e:
-        return jsonify({"ok": False, "running": False, "msg": str(e)}), 500
-
+                print(f"[server] L2Manager erro: {e}")
+                l2_mgr = None
+    return db, chain, l2_mgr
 
 # ============================================================
-# FAUCET
-# ============================================================
-@app.route("/api/faucet", methods=["POST"])
-@_rate_limit
-def faucet():
-    try:
-        data = request.get_json(force=True) or {}
-        addr = data.get("address", "").strip()
-        if not WalletManager.validate_address(addr):
-            return jsonify({"ok": False, "msg": "Endereco invalido."}), 400
-
-        agora = time.time()
-        hist = _faucet_history.setdefault(addr, [])
-        hist[:] = [t for t in hist if agora - t < FAUCET_COOLDOWN_S]
-        if len(hist) >= FAUCET_MAX_PER_ADDRESS:
-            return jsonify({"ok": False, "msg": "Limite."}), 429
-
-        pubkey = _resolve_miner_pubkey(addr)
-        if not pubkey:
-            return jsonify({
-                "ok": False,
-                "msg": (f"pubkey desconhecida para {addr}. "
-                        f"Faca uma mineracao inicial ou envie a pubkey.")
-            }), 400
-
-        block = CHAIN.mine_block(addr, pubkey)
-        if not block:
-            return jsonify({"ok": False, "msg": "Falha."}), 500
-        hist.append(agora)
-        _saldo_cache_invalidate(addr)
-        return jsonify({"ok": True, "msg": "Faucet enviado.",
-                        "amount": FAUCET_AMOUNT_BRN})
-    except Exception as e:
-        return jsonify({"ok": False, "msg": str(e)}), 500
-
-
-# ============================================================
-# INFO DA CADEIA
-# ============================================================
-@app.route("/api/chain-info", methods=["GET"])
-def chain_info():
-    return jsonify({
-        "success": True, "name": "BrunoCoin", "ticker": "BRN",
-        "height": CHAIN.db.height(), "tip_hash": CHAIN.db.tip_hash(),
-        "reward": CHAIN.current_reward(CHAIN.db.height() + 1),
-        "difficulty": CHAIN.current_difficulty(),
-    })
-
-
-@app.route("/api/status", methods=["GET"])
-def status():
-    return jsonify({
-        "name": "BrunoCoin", "ticker": "BRN",
-        "height": CHAIN.db.height(), "tip_hash": CHAIN.db.tip_hash(),
-        "utxos": CHAIN.db.count_utxos(),
-        "mempool": len(CHAIN.db.all_mempool(limit=10000)),
-        "peers": CHAIN.db.contar_peers(apenas_ativos=True),
-        "reward": CHAIN.current_reward(CHAIN.db.height() + 1),
-        "difficulty": CHAIN.current_difficulty(),
-    })
-
-
-@app.route("/api/fee-estimate", methods=["GET"])
-def fee_estimate():
-    return jsonify({"success": True,
-                    "low": CHAIN.estimate_fee("low"),
-                    "medium": CHAIN.estimate_fee("medium"),
-                    "high": CHAIN.estimate_fee("high"),
-                    "min_relay_fee": 1000})
-
-
-@app.route("/api/work", methods=["GET"])
-def work():
-    return jsonify({"success": True, "height": CHAIN.db.height(),
-                    "cumulative_work": CHAIN.cumulative_work()})
-
-
-@app.route("/api/hd/create", methods=["POST"])
-@_rate_limit
-def hd_create():
-    try:
-        data = request.get_json(force=True) or {}
-        strength = int(data.get("strength", 128))
-        if strength not in (128, 160, 192, 224, 256):
-            return jsonify({"ok": False, "msg": "strength invalido"}), 400
-        result = HDWalletManager.create(strength=strength)
-        return jsonify({"ok": True, "warning": "GUARDE o mnemonico.", **result})
-    except Exception as e:
-        return jsonify({"ok": False, "msg": str(e)}), 500
-
-
-@app.route("/api/hd/derive", methods=["POST"])
-@_rate_limit
-def hd_derive():
-    try:
-        data = request.get_json(force=True) or {}
-        mn = data.get("mnemonic", "").strip()
-        index = int(data.get("index", 0))
-        if not HDWalletManager.validate_mnemonic(mn):
-            return jsonify({"ok": False, "msg": "Mnemonico invalido"}), 400
-        return jsonify({"ok": True, **HDWalletManager.from_mnemonic(mn, index=index)})
-    except Exception as e:
-        return jsonify({"ok": False, "msg": str(e)}), 500
-
-
-@app.route("/api/peers/score", methods=["GET"])
-def peers_score():
-    try:
-        return jsonify({"success": True,
-                        "peers": CHAIN.db.listar_peers(apenas_ativos=False),
-                        "banned": CHAIN.db.listar_peers_maus(score_min=-100)})
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
-
-
-@app.route("/api/nonce/<pubkey>", methods=["GET"])
-def get_nonce(pubkey):
-    try:
-        return jsonify({"success": True, "pubkey": pubkey,
-                        "next_nonce": CHAIN.db.get_nonce_for_pubkey(pubkey)})
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
-
-
-@app.route("/api/sync-info", methods=["GET"])
-def sync_info():
-    sync = {"our_height": CHAIN.db.height(),
-            "max_peer_height": CHAIN.db.height(),
-            "percent": 100.0, "peers": 0, "tracker_peers": 0}
-    try:
-        p = Path(__file__).parent / "p2p_sync_state.json"
-        if p.exists():
-            with open(p, encoding="utf-8") as f:
-                sync.update(json.load(f))
-    except Exception:
-        pass
-
-    miner_target = ""
-    try:
-        p = Path(__file__).parent / CURRENT_WALLET_FILE
-        if p.exists():
-            with open(p, encoding="utf-8") as f:
-                miner_target = json.load(f).get("address", "")
-    except Exception:
-        pass
-
-    return jsonify({"sync": sync, "miner_target": miner_target,
-                    "bridge": {}, "bridge_onramp": {}, "bridge_offramp": {}})
-
-
-# ============================================================
-# v8.3.1: STATUS DE TRANSAÇÕES (CONFIRMAÇÃO DE ENVIO/RECEBIMENTO)
+# ENDPOINTS BRN CORE
 # ============================================================
 
-def _find_tx_in_chain(txid_str: str):
-    """Retorna (height, block, tx) ou (None, None, None)."""
+@app.route('/api/status')
+def api_status():
+    db, chain, l2_mgr = get_db()
     try:
-        row = CHAIN.db.conn.execute(
-            "SELECT block_height FROM transactions WHERE txid=?",
-            (txid_str,)
-        ).fetchone()
-        if row:
-            h = int(row["block_height"])
-            b = CHAIN.db.get_block(h)
-            if b:
-                for t in b["transactions"]:
-                    if t["txid"] == txid_str:
-                        return h, b, t
-    except Exception:
-        pass
-    top = CHAIN.db.height()
-    for h in range(top, -1, -1):
-        b = CHAIN.db.get_block(h)
-        if not b:
-            continue
-        for t in b["transactions"]:
-            if t["txid"] == txid_str:
-                return h, b, t
-    return None, None, None
-
-
-def _derivar_address(pk_hex: str):
-    try:
-        from bech32 import address_from_pubkey
-        return address_from_pubkey(bytes.fromhex(pk_hex))
-    except Exception:
-        return None
-
-
-def _classificar_tx_para_address(tx: dict, address: str):
-    """
-    direction:
-      - 'sent'     → o endereço é input (mandou BRN)
-      - 'received' → o endereço é output (recebeu BRN)
-      - 'self'     → ambos (auto-transferência)
-    """
-    addr_inputs = 0
-    for inp in tx.get("inputs", []):
-        pk = inp.get("pubkey", "")
-        if pk and _derivar_address(pk) == address:
-            addr_inputs += 1
-
-    addr_outputs = 0
-    total_recebido = 0
-    for out in tx.get("outputs", []):
-        if out.get("address") == address:
-            addr_outputs += 1
-            total_recebido += out.get("amount", 0)
-
-    if not addr_inputs and not addr_outputs:
-        return None
-
-    if addr_inputs and addr_outputs:
-        direction = "self"
-    elif addr_inputs:
-        direction = "sent"
-    else:
-        direction = "received"
-
-    return {
-        "txid": tx["txid"],
-        "direction": direction,
-        "amount": total_recebido,
-        "timestamp": tx.get("timestamp", 0),
-        "inputs": [{"txid": i["txid"], "vout": i["vout"]} for i in tx.get("inputs", [])],
-        "outputs": tx.get("outputs", []),
-    }
-
-
-@app.route("/api/tx-status/<txid_str>", methods=["GET"])
-def tx_status(txid_str):
-    """
-    Status de uma transação:
-      - pending    → na mempool, aguardando mineração
-      - confirmed  → já está num bloco (com N confirmações)
-      - not_found  → desconhecida
-    """
-    try:
-        if CHAIN.db.has_mempool(txid_str):
-            return jsonify({
-                "ok": True,
-                "txid": txid_str,
-                "status": "pending",
-                "confirmations": 0,
-                "block_height": None,
-                "block_hash": None,
-                "timestamp": int(time.time()),
-            })
-    except Exception:
-        pass
-
-    h, block, tx = _find_tx_in_chain(txid_str)
-    if h is not None:
-        current = CHAIN.db.height()
-        confirmations = current - h + 1
+        tip = db.tip_hash()
+        height = db.height()
+        mempool = len(db.all_mempool(limit=10000))
+        utxos = db.count_utxos()
+        stats = l2_mgr.stats() if l2_mgr else {}
         return jsonify({
             "ok": True,
-            "txid": txid_str,
-            "status": "confirmed",
-            "block_height": h,
-            "block_hash": block.get("hash") if block else None,
-            "confirmations": confirmations,
-            "timestamp": tx.get("timestamp", 0) if tx else 0,
-            "minerado_em": block.get("timestamp", 0) if block else 0,
+            "height": height,
+            "tip": tip,
+            "tip_short": tip[:16] + "..." if tip else "",
+            "mempool": mempool,
+            "utxos": utxos,
+            "peers": 0, # p2p pega via /api/status completo do main.py
+            "difficulty": chain.current_difficulty() if chain else 0,
+            "l2": stats,
+            "version": "8.1 L2 MINERADO",
+            "btc_address": btc_config.BTC_RECEIVE_ADDRESS if L2_ENABLED else "",
+            "rate": f"1 BTC = {btc_config.BRN_PER_BTC} BRN" if L2_ENABLED else ""
         })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
-    return jsonify({
-        "ok": True,
-        "txid": txid_str,
-        "status": "not_found",
-        "confirmations": 0,
-        "block_height": None,
-        "block_hash": None,
-    })
+@app.route('/api/height')
+def api_height():
+    db, _, _ = get_db()
+    return jsonify({"height": db.height()})
 
+@app.route('/api/block/<int:height>')
+def api_block(height):
+    db, _, _ = get_db()
+    block = db.get_block(height)
+    if not block:
+        return jsonify({"error": "block not found"}), 404
+    return jsonify(block)
 
-@app.route("/api/minhas-txs/<address>", methods=["GET"])
-def minhas_txs(address):
-    """Lista transações do endereço com direction + status + confirmações."""
-    if not WalletManager.validate_address(address):
-        return jsonify({"ok": False, "msg": "Endereco invalido."}), 400
+@app.route('/api/block/hash/<hash>')
+def api_block_by_hash(hash):
+    db, _, _ = get_db()
+    block = db.get_block_by_hash(hash)
+    if not block:
+        return jsonify({"error": "block not found"}), 404
+    return jsonify(block)
 
-    txs = []
-    total_conf = CHAIN.db.height()
-
-    for h in range(total_conf + 1):
-        block = CHAIN.db.get_block(h)
-        if not block:
-            continue
-        for tx in block.get("transactions", []):
-            info = _classificar_tx_para_address(tx, address)
-            if info:
-                info["status"] = "confirmed"
-                info["block_height"] = h
-                info["confirmations"] = total_conf - h + 1
-                info["minerado_em"] = block.get("timestamp", 0)
-                txs.append(info)
-
-    for tx in CHAIN.db.all_mempool(limit=1000):
-        info = _classificar_tx_para_address(tx, address)
-        if info:
-            info["status"] = "pending"
-            info["block_height"] = None
-            info["confirmations"] = 0
-            info["minerado_em"] = 0
-            txs.append(info)
-
-    txs.sort(key=lambda t: (t["status"] != "pending", -t.get("timestamp", 0)))
-
-    return jsonify({
-        "ok": True,
-        "address": address,
-        "count": len(txs),
-        "height": total_conf,
-        "transactions": txs[:200],
-    })
-
-
-@app.route("/api/verificar-recebimento/<address>/<txid_str>", methods=["GET"])
-def verificar_recebimento(address, txid_str):
-    """
-    Verifica SE uma tx específica chegou PARA um endereço.
-    Resposta direta para "chegou pra mim?".
-    """
-    if not WalletManager.validate_address(address):
-        return jsonify({"ok": False, "msg": "Endereco invalido."}), 400
-
-    if CHAIN.db.has_mempool(txid_str):
-        tx = CHAIN.db.get_mempool_tx(txid_str)
-        if tx:
-            recebido = sum(o["amount"] for o in tx.get("outputs", [])
-                           if o.get("address") == address)
-            return jsonify({
-                "ok": True,
-                "chegou": recebido > 0,
-                "status": "pending",
-                "valor": recebido,
-                "confirmacoes": 0,
-                "msg": "Na mempool. Aguardando mineracao.",
+@app.route('/api/blocks/latest')
+def api_blocks_latest():
+    db, _, _ = get_db()
+    limit = int(request.args.get('limit', 10))
+    try:
+        blocks = db.conn.execute("SELECT * FROM blocks ORDER BY height DESC LIMIT?", (limit,)).fetchall()
+        result = []
+        for r in blocks:
+            result.append({
+                "height": r["height"],
+                "hash": r["hash"],
+                "prev_hash": r["prev_hash"],
+                "timestamp": r["timestamp"],
+                "nonce": r["nonce"],
+                "difficulty": r["difficulty"],
+                "merkle": r["merkle"]
             })
-        return jsonify({"ok": True, "chegou": False, "status": "pending",
-                        "valor": 0, "confirmacoes": 0})
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-    h, block, tx = _find_tx_in_chain(txid_str)
-    if h is not None and tx:
-        recebido = sum(o["amount"] for o in tx.get("outputs", [])
-                       if o.get("address") == address)
-        confirmacoes = CHAIN.db.height() - h + 1
+@app.route('/api/balance/<address>')
+def api_balance(address):
+    db, _, _ = get_db()
+    try:
+        bal = db.get_balance(address)
+        utxos = db.get_utxos_by_address(address)
         return jsonify({
-            "ok": True,
-            "chegou": recebido > 0,
-            "status": "confirmed",
-            "valor": recebido,
-            "confirmacoes": confirmacoes,
-            "block_height": h,
-            "msg": f"Confirmada no bloco #{h} ({confirmacoes} confirmacoes).",
+            "address": address,
+            "balance_sats": bal,
+            "balance_brn": bal / 1e8,
+            "utxos": len(utxos)
         })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-    return jsonify({"ok": True, "chegou": False, "status": "not_found",
-                    "valor": 0, "confirmacoes": 0,
-                    "msg": "TX nao encontrada."})
+@app.route('/api/utxos/<address>')
+def api_utxos(address):
+    db, _, _ = get_db()
+    try:
+        utxos = db.get_utxos_by_address(address)
+        return jsonify(utxos)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
+@app.route('/api/mempool')
+def api_mempool():
+    db, _, _ = get_db()
+    try:
+        mps = db.all_mempool(limit=100)
+        return jsonify([{
+            "txid": t["txid"],
+            "timestamp": t.get("timestamp", 0),
+            "is_l2": bool(t.get("data", {}).get("l2")),
+            "type": t.get("data", {}).get("type", "normal")
+        } for t in mps])
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/tx/<txid>')
+def api_tx(txid):
+    db, _, _ = get_db()
+    try:
+        row = db.conn.execute("SELECT * FROM transactions WHERE txid=?", (txid,)).fetchone()
+        if not row:
+            # tenta mempool
+            mp = db.get_mempool_tx(txid)
+            if mp:
+                return jsonify({"in_mempool": True, "tx": mp})
+            return jsonify({"error": "tx not found"}), 404
+        return jsonify(dict(row))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/tx/send', methods=['POST'])
+def api_send_tx():
+    db, chain, _ = get_db()
+    try:
+        data = request.json
+        tx = data.get('tx')
+        if not tx:
+            return jsonify({"error": "tx required"}), 400
+
+        # Validação básica
+        ok, msg = chain.validate_tx(tx, db.height() + 1, is_coinbase=False)
+        if not ok:
+            return jsonify({"error": f"tx invalid: {msg}"}), 400
+
+        db.add_mempool(tx, fee=data.get('fee', 0))
+        return jsonify({"ok": True, "txid": tx["txid"], "in_mempool": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ============================================================
+# ENDPOINTS L2 BTC -> BRN - VALIDADOS POR MINERAÇÃO
+# ============================================================
+
+@app.route('/api/l2/quote', methods=['GET'])
+def l2_quote():
+    """GET /api/l2/quote?btc_sats=100000 -> cotação sem criar ordem"""
+    _, _, l2_mgr = get_db()
+    if not L2_ENABLED or not l2_mgr:
+        return jsonify({"error": "L2 desabilitado - configure btc_config.py"}), 400
+    try:
+        sats = int(request.args.get('btc_sats', 100000))
+        q = l2_mgr.quote(sats)
+        q["btc_address"] = btc_config.BTC_RECEIVE_ADDRESS
+        q["network"] = btc_config.BTC_NETWORK
+        q["min_confirmations"] = btc_config.BTC_MIN_CONFIRMATIONS
+        q["flow"] = "BTC RPC -> mempool -> mineração PoW -> BRN liberado"
+        return jsonify(q)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/l2/create', methods=['POST'])
+def l2_create():
+    """POST /api/l2/create {"btc_sats":100000,"buyer_brn":"brn1q..."} -> cria escrow OPEN"""
+    _, _, l2_mgr = get_db()
+    if not L2_ENABLED or not l2_mgr:
+        return jsonify({"error": "L2 desabilitado"}), 400
+    try:
+        data = request.json
+        if not data:
+            return jsonify({"error": "json required"}), 400
+        btc_sats = int(data.get('btc_sats', 0))
+        buyer = data.get('buyer_brn', '').strip()
+        if not buyer:
+            return jsonify({"error": "buyer_brn obrigatório (brn1q...)"}), 400
+
+        order = l2_mgr.create_order(btc_sats, buyer)
+        return jsonify(order)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+@app.route('/api/l2/order/<escrow_id>', methods=['GET'])
+def l2_order(escrow_id):
+    """GET /api/l2/order/escrow_abc123 -> status OPEN / BTC_DETECTED / RELEASED"""
+    _, _, l2_mgr = get_db()
+    if not L2_ENABLED or not l2_mgr:
+        return jsonify({"error": "L2 desabilitado"}), 400
+    try:
+        order = l2_mgr.get_order(escrow_id)
+        if not order:
+            return jsonify({"error": "escrow not found"}), 404
+        # explica fluxo
+        status_map = {
+            "OPEN": "Aguardando BTC no endereço",
+            "BTC_DETECTED": "BTC confirmado via RPC, na mempool aguardando mineração PoW",
+            "RELEASED": "Minerado! BRN creditado na carteira",
+            "EXPIRED": "Expirado (24h)",
+            "CANCELLED": "Cancelado"
+        }
+        order["status_desc"] = status_map.get(order["status"], order["status"])
+        return jsonify(order)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/l2/list', methods=['GET'])
+def l2_list():
+    """GET /api/l2/list?buyer=brn1q...&status=OPEN"""
+    db, _, l2_mgr = get_db()
+    if not L2_ENABLED or not l2_mgr:
+        return jsonify({"error": "L2 desabilitado"}), 400
+    try:
+        buyer = request.args.get('buyer')
+        status = request.args.get('status', 'OPEN')
+        if buyer:
+            escrows = [e for e in db.get_l2_escrows() if e.get('buyer') == buyer]
+        else:
+            escrows = db.get_l2_escrows(status=status) if status!= 'ALL' else db.get_l2_escrows()
+        return jsonify(escrows[:100]) # limite 100
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/l2/stats')
+def l2_stats():
+    db, chain, l2_mgr = get_db()
+    if not L2_ENABLED:
+        return jsonify({"error": "L2 desabilitado"}), 400
+    try:
+        if l2_mgr:
+            s = l2_mgr.stats()
+        else:
+            s = {"open": 0, "btc_detected": 0, "released": 0}
+
+        # stats da chain L2
+        if chain:
+            l2_chain_stats = chain.get_l2_stats()
+            s.update(l2_chain_stats)
+
+        s["btc_address"] = btc_config.BTC_RECEIVE_ADDRESS
+        s["network"] = btc_config.BTC_NETWORK
+        s["rate"] = f"1 BTC = {btc_config.BRN_PER_BTC} BRN"
+        s["flow"] = "BTC RPC (Blockstream) -> BTC_DETECTED -> mempool -> mine_block() -> RELEASED"
+        s["validation"] = "PoW - BRN liberado só após bloco minerado"
+        return jsonify(s)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/l2/cancel/<escrow_id>', methods=['POST'])
+def l2_cancel(escrow_id):
+    db, _, _ = get_db()
+    if not L2_ENABLED:
+        return jsonify({"error": "L2 desabilitado"}), 400
+    try:
+        escrow = db.get_l2_escrow_by_id(escrow_id)
+        if not escrow:
+            return jsonify({"error": "escrow not found"}), 404
+        if escrow["status"]!= "OPEN":
+            return jsonify({"error": f"só pode cancelar OPEN, status atual {escrow['status']}"}), 400
+        db.update_l2_escrow_status(escrow_id, "CANCELLED")
+        return jsonify({"ok": True, "escrow_id": escrow_id, "status": "CANCELLED"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ============================================================
+# EXPLORER / HEALTH
+# ============================================================
+
+@app.route('/')
+def index():
+    return jsonify({
+        "name": "BRN Node API v8.1 L2 MINERADO",
+        "version": "8.1.0",
+        "endpoints": [
+            "GET /api/status",
+            "GET /api/balance/<address>",
+            "GET /api/block/<height>",
+            "GET /api/blocks/latest?limit=10",
+            "GET /api/mempool",
+            "POST /api/tx/send",
+            "GET /api/l2/quote?btc_sats=100000",
+            "POST /api/l2/create",
+            "GET /api/l2/order/<escrow_id>",
+            "GET /api/l2/list?buyer=brn1q...&status=OPEN",
+            "GET /api/l2/stats"
+        ],
+        "l2_flow": "BTC RPC -> mempool -> PoW -> BRN liberado",
+        "btc_address": btc_config.BTC_RECEIVE_ADDRESS if L2_ENABLED else "configure btc_config.py"
+    })
+
+@app.route('/health')
+def health():
+    db, _, _ = get_db()
+    return jsonify({"ok": True, "height": db.height(), "l2_enabled": L2_ENABLED})
 
 # ============================================================
 # MAIN
 # ============================================================
-if __name__ == "__main__":
-    port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print(f"BRN Server v8.3.2 - http://0.0.0.0:{port}")
-    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
+if __name__ == '__main__':
+    get_db() # init
+    print(f"=== BRN API v8.1 L2 MINERADO ===")
+    print(f"DB: {DB_PATH}")
+    if L2_ENABLED:
+        print(f"BTC Address: {btc_config.BTC_RECEIVE_ADDRESS}")
+        print(f"Rate: 1 BTC = {btc_config.BRN_PER_BTC} BRN")
+        print(f"Flow: BTC RPC -> mempool -> mine_block() PoW -> RELEASED")
+    print(f"HTTP: http://0.0.0.0:{WEB_PORT}")
+    app.run(host="0.0.0.0", port=WEB_PORT, threaded=True, debug=False, use_reloader=False)
