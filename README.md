@@ -1,3 +1,6 @@
+Ferramenta: Bitcoin Core + BDK (Bitcoin Development Kit) ou Blockstream Greenlight / BTCPay Server
+Você sobe um node ou usa API como Mempool.space / BlockCypher e monitora os endereços que você gerou.
+
 # BRN CHAIN v8.1 L2 MINERADO - MANUAL DE AUDITORIA
 Versão: 8.1.0 | Data: 01/10/2026 | Autor: Bruno
 
