@@ -1,3 +1,8 @@
+a) Infisical - Recomendo esse hoje
+•  Open source, self-hosted, plano cloud gratuito.
+•  Você guarda a chave lá e seu app busca via API com um token.
+•  infisical.com
+
 Como usar:
 1.   pip install bitcoinlib
 2.   Preencha só 2 campos no código:
