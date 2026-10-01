@@ -1,0 +1,47 @@
+# contracts/escrow_btc_brn.py - Contrato pronto BTC -> BRN
+import time, hashlib, uuid, json
+
+class EscrowBTCtoBRN:
+    def __init__(self, creator_wallet, brn_amount_sats, btc_expected_sats, btc_address, buyer_wallet=None):
+        self.escrow_id = f"escrow_{uuid.uuid4().hex[:12]}"
+        self.creator = creator_wallet
+        self.buyer = buyer_wallet
+        self.brn_amount = int(brn_amount_sats)
+        self.btc_expected = int(btc_expected_sats)
+        self.btc_address = btc_address
+        self.btc_txid = None
+        self.status = "OPEN"
+        self.created_at = int(time.time())
+        self.expires_at = self.created_at + 3600*24
+        self.l2_hash = self._calc_hash()
+
+    def _calc_hash(self):
+        data = f"{self.escrow_id}{self.brn_amount}{self.btc_expected}{self.btc_address}{self.created_at}"
+        return hashlib.sha256(data.encode()).hexdigest()
+
+    def to_dict(self):
+        return {
+            "escrow_id": self.escrow_id,
+            "creator": self.creator,
+            "buyer": self.buyer,
+            "brn_amount": self.brn_amount,
+            "btc_expected_sats": self.btc_expected,
+            "btc_address": self.btc_address,
+            "btc_txid": self.btc_txid,
+            "status": self.status,
+            "created_at": self.created_at,
+            "expires_at": self.expires_at,
+            "l2_hash": self.l2_hash,
+            "type": "BTC_TO_BRN"
+        }
+
+    def to_l1_tx(self):
+        return {
+            "type": "l2_settlement",
+            "subtype": "btc_to_brn",
+            "escrow_id": self.escrow_id,
+            "l2_hash": self.l2_hash,
+            "btc_txid": self.btc_txid,
+            "status": self.status,
+            "timestamp": int(time.time())
+        }
