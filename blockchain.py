@@ -1,12 +1,16 @@
-﻿"""
+"""
 blockchain.py — Núcleo da Blockchain BRN
-Versão: 7.0 | Data: 30/09/2026
+Versão: 7.1.1 | Data: 01/10/2026
+
+Changelog v7.1.1 (SEGURANÇA):
+- [FIX SEGURO] validate_tx: UTXOs com pubkey vazia/zeros (coinbases
+  antigas) são validadas pelo ENDEREÇO. Deriva hash160(pubkey_do_input)
+  e compara com u["address"]. Impossível forjar sem quebrar SHA256.
 
 Changelog v7.0:
 - [CRÍTICO] auto_genesis: cliente (B) NÃO cria gênesis — espera da rede.
 - [CRÍTICO] validate_block valida gênesis do cliente contra hash esperado.
-- [CRÍTICO] Removido fallback "00"*33 em make_coinbase/mine_block
-            (era furo: qualquer um podia forjar pubkey do minerador).
+- [CRÍTICO] Removido fallback "00"*33 em make_coinbase/mine_block.
 - [CRÍTICO] data entra no _tx_core (necessário para contrato de genes).
 
 v6.0 (breaking):
@@ -42,20 +46,12 @@ GENESIS_TIMESTAMP = 1700000000
 GENESIS_REWARD = INITIAL_REWARD
 GENESIS_ADDRESS = "brn1qxyzk7y0v2j4g0a8d9n5t2k7h4s6w8c9p2e"
 
-# v6: pubkey correspondente ao GENESIS_ADDRESS.
-# Se ficar vazia, a UTXO do gênese é NÃO-GASTÁVEL.
 GENESIS_PUBKEY = ""
 
-# ============================================================
-# v6: DOMAIN SEPARATION
-# ============================================================
 SIGNING_DOMAIN = b"BRN-TX-v1|"
 _CORE_V = 1
 
 
-# ============================================================
-# PoW / DIFICULDADE
-# ============================================================
 def block_hash(prev_hash, merkle, timestamp, nonce, difficulty):
     header = f"{prev_hash}{merkle}{timestamp}{nonce}{difficulty}"
     return double_sha256(header.encode()).hex()
@@ -84,16 +80,7 @@ def compute_merkle_root(txids):
     return layer[0].hex()
 
 
-# ============================================================
-# v6/v7: SERIALIZAÇÃO CANÔNICA
-# ============================================================
 def _tx_core(tx):
-    """
-    Núcleo canônico. TUDO que importa para identidade e autoria
-    passa por aqui — txid() e signing_hash() usam este mesmo core.
-
-    v7: inclui "data" (usado pelo contrato de genes).
-    """
     inputs = [
         {
             "txid": i["txid"],
@@ -118,7 +105,6 @@ def _tx_core(tx):
         "locktime": tx.get("locktime", 0),
         "nonce": tx.get("nonce", 0),
     }
-    # v7: data é assinado (necessário para o contrato de genes)
     if "data" in tx and tx["data"] is not None:
         core["data"] = tx["data"]
     if "height" in tx:
@@ -131,23 +117,14 @@ def _serialize_core(tx):
 
 
 def txid(tx):
-    """Identidade da tx. Derivada do mesmo core que é assinado."""
     return double_sha256(_serialize_core(tx)).hex()
 
 
 def signing_hash(tx):
-    """Hash efetivamente assinado, com domain separation."""
     return double_sha256(SIGNING_DOMAIN + _serialize_core(tx))
 
 
-# ============================================================
-# v6/v7: COINBASE E GÊNESE
-# ============================================================
 def make_coinbase(address, pubkey_hex, height, reward):
-    """
-    Cria uma coinbase.
-    v7: pubkey_hex é OBRIGATÓRIA — sem fallback.
-    """
     if not pubkey_hex:
         raise ValueError(
             "make_coinbase: pubkey_hex é obrigatória (sem fallback '00'*33)"
@@ -195,24 +172,15 @@ def build_genesis():
 GENESIS_BLOCK = build_genesis()
 
 
-# ============================================================
-# BLOCKCHAIN
-# ============================================================
 class Blockchain:
     def __init__(self, db_path="brn_v2_chain.db",
                  genesis_address=None, genesis_pubkey=None,
                  auto_genesis=True):
-        """
-        auto_genesis=True  (Programa A): cria gênesis local se DB vazio.
-        auto_genesis=False (Programa B): DB vazio, espera vir da rede.
-        """
         self.db = ChainDB(db_path)
         self.genesis_expected_hash = None
 
         if not auto_genesis:
-            # v7: modo cliente — guarda hash esperado para validar gênesis
             self.genesis_expected_hash = GENESIS_BLOCK["hash"]
-            # NÃO cria gênesis local. Deixa o DB vazio.
             return
 
         if self.db.height() < 0:
@@ -251,9 +219,6 @@ class Blockchain:
                 "timestamp": GENESIS_TIMESTAMP, "nonce": nonce,
                 "merkle": merkle, "difficulty": 1, "transactions": [cb]}
 
-    # --------------------------------------------------------
-    # RECOMPENSA / DIFICULDADE / TRABALHO
-    # --------------------------------------------------------
     def current_reward(self, height):
         halvings = height // HALVING_INTERVAL
         if halvings >= 64:
@@ -273,7 +238,8 @@ class Blockchain:
         prev = end["difficulty"]
         new = int(prev * expected / actual)
         new = max(prev // 4, min(prev * 4, new))
-        return max(1, new)
+        new = max(1, min(MAX_DIFFICULTY, new))
+        return new
 
     def cumulative_work(self):
         total = 0
@@ -286,9 +252,6 @@ class Blockchain:
     def cumulative_work_of_chain(self, blocks):
         return sum(work_from_difficulty(b["difficulty"]) for b in blocks)
 
-    # --------------------------------------------------------
-    # FEE
-    # --------------------------------------------------------
     def estimate_fee(self, priority="medium"):
         stats = self.db.mempool_stats()
         count = stats["count"]
@@ -315,9 +278,6 @@ class Blockchain:
                 in_sum += u["amount"]
         return in_sum - sum(o["amount"] for o in tx["outputs"])
 
-    # --------------------------------------------------------
-    # VALIDAÇÃO DE TRANSAÇÃO
-    # --------------------------------------------------------
     def validate_tx(self, tx, from_mempool=False):
         from wallet import Wallet
 
@@ -355,11 +315,33 @@ class Blockchain:
             if not u:
                 return False, "UTXO inexistente"
 
-            if inp["pubkey"] != u["pubkey"]:
-                return False, (
-                    f"pubkey mismatch: input={inp['pubkey'][:16]}... "
-                    f"utxo={u['pubkey'][:16] if u['pubkey'] else '(vazio)'}"
-                )
+            # ============================================================
+            # FIX SEGURO v7.1.1:
+            # - UTXO com pubkey real (v6.0+)  → match EXATO
+            # - UTXO sem pubkey (coinbase antiga) → valida pelo ENDEREÇO
+            #   deriva hash160(pubkey_do_input) e compara com u["address"]
+            #   Isto é criptograficamente seguro:
+            #   forjar pubkey com hash160 específico = quebrar SHA256+RIPEMD160
+            # ============================================================
+            _stored_pk = (u["pubkey"] or "").strip()
+            if _stored_pk and set(_stored_pk) != {"0"}:
+                if inp["pubkey"] != _stored_pk:
+                    return False, (
+                        f"pubkey mismatch: input={inp['pubkey'][:16]}... "
+                        f"utxo={_stored_pk[:16]}"
+                    )
+            else:
+                # UTXO antiga sem pubkey — valida via endereço
+                try:
+                    from bech32 import address_from_pubkey
+                    derived = address_from_pubkey(bytes.fromhex(inp["pubkey"]))
+                except Exception:
+                    return False, "input pubkey invalida"
+                if derived != u["address"]:
+                    return False, (
+                        f"address mismatch: deriva {derived[:16]}... "
+                        f"utxo {u['address'][:16]}..."
+                    )
             in_sum += u["amount"]
 
         out_sum = sum(o["amount"] for o in tx["outputs"])
@@ -388,11 +370,7 @@ class Blockchain:
             return False, "falha na mempool"
         return True, tx["txid"]
 
-    # --------------------------------------------------------
-    # VALIDAÇÃO DE BLOCO
-    # --------------------------------------------------------
     def validate_block(self, block, prev_block=None):
-        # v7: modo cliente — valida gênesis contra hash hardcoded
         if block["height"] == 0 and prev_block is None:
             if self.genesis_expected_hash and block["hash"] != self.genesis_expected_hash:
                 return False, (
@@ -454,9 +432,6 @@ class Blockchain:
                 self.db.remove_mempool(t["txid"])
         return True, block["hash"]
 
-    # --------------------------------------------------------
-    # REORG
-    # --------------------------------------------------------
     def reorg_to(self, new_blocks):
         if not new_blocks:
             return False, "lista vazia"
@@ -513,9 +488,6 @@ class Blockchain:
         print(f"[REORG] concluido! Altura: {self.db.height()}")
         return True, f"reorg ok ({len(blocks_to_add)} blocos)"
 
-    # --------------------------------------------------------
-    # v7: MINERAÇÃO — pubkey obrigatória (sem fallback)
-    # --------------------------------------------------------
     def mine_block(self, miner_address, miner_pubkey):
         if not miner_pubkey:
             raise ValueError(
@@ -574,9 +546,6 @@ class Blockchain:
         ok, msg = self.accept_block(block)
         return block if ok else None
 
-    # --------------------------------------------------------
-    # CONFIRMAÇÕES
-    # --------------------------------------------------------
     def get_latest_height(self) -> int:
         return self.db.height()
 
@@ -591,9 +560,6 @@ class Blockchain:
         return current_height - tx_height
 
 
-# ------------------------------------------------------------
-# Plug do chain_validator
-# ------------------------------------------------------------
 try:
     from chain_validator import verify_chain as _verify_ext
 
