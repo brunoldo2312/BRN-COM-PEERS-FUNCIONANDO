@@ -6,9 +6,13 @@ cd /d "%~dp0"
 REM ============================================================
 REM   BRN Node - HUB CENTRAL
 REM   ============================================
-REM   IMPORTANTE: As DUAS senhas abaixo precisam BATER com
-REM   as usadas quando este PC criou a node_identity.enc
-REM   (ou voce apaga a identity e deixa criar de novo)
+REM   IMPORTANTE:
+REM     - Se voce LEMBRA a senha usada quando criou a
+REM       node_identity.enc, coloque ela em BRN_NODE_PASSWORD.
+REM     - Se NAO lembra, deixe como esta e APAGUE o arquivo
+REM       node_identity.enc antes de rodar.
+REM     - Com BRN_NODE_AUTORESET=1, se a senha estiver errada
+REM       o main.py renomeia para .corrompida e cria uma nova.
 REM ============================================================
 
 echo ============================================================
@@ -19,17 +23,11 @@ echo.
 REM ============================================================
 REM  >>>  SENHAS - AJUSTE AQUI <<<
 REM ============================================================
-REM
-REM  Se voce LEMBRA a senha usada pra criar node_identity.enc
-REM  quando rodou antes:
-REM
-REM  Se voce NAO lembra: deixa como esta e APAGUE o arquivo
-REM  node_identity.enc antes de rodar (o .bat cria um novo).
-REM
-REM ============================================================
+set "BRN_NODE_PASSWORD=senha-da-carteira-2026"
+set "BRN_WEB_PASS=senha-da-carteira-2026"
 
-set "BRN_NODE_PASSWORD="senha-da-carteira-2026"
-set "BRN_WEB_PASS="senha-da-carteira-2026"
+REM === Auto-reset em caso de senha errada ===
+set "BRN_NODE_AUTORESET=1"
 
 REM ============================================================
 REM  REDE - IGUAL EM TODOS OS PCs
@@ -95,17 +93,21 @@ echo [ok] Arquivos essenciais presentes
 echo.
 
 REM ============================================================
-REM  4) VERIFICA / CRIA IDENTIDADE
+REM  4) VERIFICA / AVISA SOBRE IDENTIDADE
 REM ============================================================
 if exist node_identity.enc (
     echo [i] node_identity.enc JA EXISTE
     echo     Senha configurada: !BRN_NODE_PASSWORD!
+    echo     Auto-reset:        !BRN_NODE_AUTORESET!
     echo.
-    echo     Se der erro "Falha ao decifrar" depois, sera porque
-    echo     a senha acima nao bate. Nesse caso:
-    echo       1. Feche este .bat ^(Ctrl+C^)
-    echo       2. Rode: ren node_identity.enc node_identity.enc.antiga
-    echo       3. Rode este .bat de novo
+    echo     Se a senha estiver errada:
+    if "!BRN_NODE_AUTORESET!"=="1" (
+        echo       - Sera renomeada para .corrompida automaticamente
+        echo       - E uma identidade NOVA sera criada
+    ) else (
+        echo       - Vai travar. Renomeie manualmente:
+        echo         ren node_identity.enc node_identity.enc.antiga
+    )
     echo.
 ) else (
     echo [i] node_identity.enc NAO existe - sera criada agora
@@ -129,7 +131,7 @@ REM ============================================================
 echo [*] Testando tracker !BRN_TRACKER!...
 python -c "import urllib.request; r=urllib.request.urlopen('!BRN_TRACKER!/', timeout=15); print('[ok]', r.read().decode().strip())" 2>nul
 if errorlevel 1 (
-    echo [!] Tracker nao respondeu ^(pode estar dormindo^)
+    echo [!] Tracker nao respondeu ^(pode estar dormindo - free tier^)
 )
 echo.
 
@@ -156,6 +158,7 @@ echo   Modo       : HUB
 echo   Secret rede: !BRN_NETWORK_SECRET!
 echo   Node pass  : !BRN_NODE_PASSWORD!
 echo   Web pass   : !BRN_WEB_PASS!
+echo   Auto-reset : !BRN_NODE_AUTORESET!
 echo   Tracker    : !BRN_TRACKER!
 echo   Bootstrap  : !BRN_BOOTSTRAP_PEERS!
 echo   Mineracao  : !BRN_MINER_AUTO! ^(intervalo !BRN_MINER_INTERVAL!s^)
@@ -165,6 +168,7 @@ echo   Explorer   : http://127.0.0.1:!BRN_EXPLORER_PORT!
 echo ============================================================
 echo.
 echo   ATENCAO: deixe esta janela ABERTA enquanto o hub roda.
+echo   Feche = todos os peers perdem conexao com voce.
 echo.
 
 REM ============================================================
