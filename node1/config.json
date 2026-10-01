@@ -1,0 +1,12 @@
+{
+  "web_port": 5000,
+  "explorer_port": 8080,
+  "p2p_port": 6001,
+  "db_path": "brn_v2_chain.db",
+  "miner_enabled": true,
+  "headless": false,
+  "upnp": false,
+  "tracker_url": "",
+  "bootstrap_peers": [],
+  "github": {"user": "", "repo": "", "token": ""}
+}
