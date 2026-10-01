@@ -16,3 +16,9 @@ criar_arquivos.bat
 atualizar_git.cmd
 push.cmd
 verificacao*.txt
+# Adicione isso
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+mnemonic.txt
+seed.txt
