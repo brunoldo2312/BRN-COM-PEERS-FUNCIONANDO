@@ -1,3 +1,9 @@
+Python com bitcoinlib:
+from bitcoinlib.wallets import Wallet
+w = Wallet.create('minha_carteira', network='bitcoin')
+key = w.new_key()
+print(key.address) # vai gerar um bc1q...
+print(key.wif) # chave privada - NUNCA exponha isso
 Ferramenta: Bitcoin Core + BDK (Bitcoin Development Kit) ou Blockstream Greenlight / BTCPay Server
 Você sobe um node ou usa API como Mempool.space / BlockCypher e monitora os endereços que você gerou.
 
