@@ -1,3 +1,4 @@
+
 📖 Manual BRN — Dois Cliques e Pronto
 🎯 O que você vai fazer
 Baixar o BRN do GitHub
@@ -395,4 +396,254 @@ Análise:
 Prova: A função Blockchain.cumulative_work() está funcionando. Essa é a base da regra de fork choice (Bitcoin-style), que garante que em caso de fork, a cadeia com mais trabalho seja escolhida.
 
 Status: ✅ PASSOU
+📝 BRN — A Moeda que Saiu do Papel e Virou Rede
+🌱 Como tudo começou
+O BRN (BrunoCoin) nasceu como um projeto pessoal: uma blockchain L1 feita do zero, sem framework pronto, sem atalhos. Só Python, matemática e a vontade de entender como o Bitcoin funciona por dentro.
+
+No começo era simples:
+
+Um gênese e alguns blocos
+
+Um minerador rodando em Python
+
+Uma API HTTP local
+
+Era o v3. Funcionava, mas era frágil. Não tinha carteira HD, não tinha consenso real, não tinha P2P de verdade.
+
+🚀 A evolução — versão por versão
+v3 → v4 — A base sólida
+Carteira HD Wallet BIP39/BIP44 (mnemônico de 12 palavras)
+
+Cumulative work para fork choice (o mesmo do Bitcoin)
+
+Reorg com backup e restore automático
+
+Estimativa de taxa por prioridade
+
+v4 → v5 — Proteção contra replay
+Nonce por transação — impede que a mesma tx seja reenviada
+
+Chain validator separado (auditoria completa da cadeia)
+
+Validação mais rígida de UTXO, fee e pubkey binding
+
+v5 → v6 — Criptografia de verdade
+Argon2id para derivar chave da senha (3 iterações, 64 MiB de RAM)
+
+ChaCha20-Poly1305 para cifrar tudo em disco
+
+Ed25519 para identidade do nó P2P
+
+Escrita atômica com fsync + rename — nada de arquivo corrompido
+
+Permissão 0600 nos arquivos de carteira
+
+v6.1 → v6.2 — Rede resistente
+Handshake Ed25519 — só entra na rede quem tem a chave
+
+Sync incremental — baixa só os blocos novos
+
+Backoff exponencial — se um peer falha, tenta de novo com espera crescente
+
+Métricas — latência, taxa, peers, blocos contribuídos
+
+Modo read-only — pode sincronizar sem minerar
+
+Auto-reset de identidade se a senha estiver errada
+
+v6.3 → v6.4 — Performance
+Peer registry no banco — a carteira agora vê os peers reais
+
+Sync paralelo — 4 threads baixando lotes ao mesmo tempo
+
+10x mais rápido na sincronização inicial
+
+v7 → v8 — Ponte com o mundo real
+Bridge BTC ↔ BRN — BRN vira ponte para Bitcoin
+
+Watcher de depósito — detecta BTC recebido e credita BRN
+
+Relay P2P — conecta através de nós intermediários
+
+Descoberta v2 — multicast + tracker HTTP + GitHub + bootstrap
+
+SPV mode — modo cliente leve (só cabeçalhos)
+
+💎 O que é a BRN hoje
+Uma L1 própria
+Não é token em cima de outra blockchain. É uma camada 1 completa, com:
+
+Próprio gênese
+
+Própria curva criptográfica (secp256k1)
+
+Próprio algoritmo de consenso (PoW Bitcoin-style)
+
+Próprio formato de endereço (bech32 — brn1...)
+
+Características técnicas
+Item	Valor
+Ticker	BRN
+Decimais	8 (100.000.000 sats = 1 BRN)
+Supply máximo	21.000.000 BRN
+Recompensa inicial	50 BRN
+Halving	A cada 210.000 blocos
+Block time	120 segundos
+Ajuste de dificuldade	A cada 2016 blocos
+Dificuldade inicial	4
+Fork choice	Cumulative work (Bitcoin-style)
+Assinatura	Schnorr (BIP340) com fallback ECDSA
+Endereço	bech32 (brn1..., 20 bytes)
+Carteira HD	BIP39 + BIP44
+Rede P2P
+Item	Valor
+Protocolo	BRN5/1.0
+Porta TCP	6001
+Multicast	239.255.42.99:50007
+Autenticação	Ed25519 handshake
+Peer scoring	Ban automático após -100 pontos
+Rate limit	20 msgs/segundo por IP
+Max msg	8 MB
+Descoberta de peers — 4 camadas
+Multicast LAN — acha peers na mesma rede Wi-Fi em segundos
+
+Tracker HTTP — servidor público (brn-tracker.onrender.com)
+
+GitHub — arquivo peers.json como "caderninho compartilhado"
+
+Bootstrap — IPs fixos em bootstrap_peers.json
+
+Serviços
+Serviço	Porta	URL
+API HTTP	5000	http://127.0.0.1:5000
+Explorer	8080	http://127.0.0.1:8080
+Carteira desktop	pywebview	janela nativa
+P2P	6001	TCP
+🛡️ Segurança — 7 camadas
+Criptografia de chave — Argon2id + ChaCha20-Poly1305
+
+Handshake P2P — Ed25519 autentica cada nó
+
+Nonce anti-replay — cada tx só é válida uma vez
+
+Peer scoring — peers maus são banidos
+
+Rate limit — bloqueia flood de mensagens
+
+Validação em 2 níveis — tx e bloco (chain_validator)
+
+Escrita atômica — impossível corromper arquivo em disco
+
+🌍 O que dá pra fazer com BRN
+Como usuário
+✅ Criar carteira HD com mnemônico BIP39
+
+✅ Minerar blocos — ganhar 50 BRN por bloco
+
+✅ Enviar e receber BRN entre endereços
+
+✅ Salvar carteira criptografada com senha
+
+✅ Rodar explorador para ver blocos em tempo real
+
+✅ Faucet grátis para começar a testar
+
+Como nó
+✅ Rodar um nó completo — valida tudo
+
+✅ Sincronizar com peers — baixa a blockchain completa
+
+✅ Contribuir para a rede — retransmite blocos
+
+✅ Modo read-only — só sincroniza sem minerar
+
+Como dev
+✅ API REST completa — /api/status, /api/transfer, /api/mine
+
+✅ Bridge BTC ↔ BRN — integra com Bitcoin
+
+✅ Relay P2P — conecta em redes restritas
+
+✅ Explorer com CORS — integra com qualquer frontend
+
+🎯 Por que a BRN é diferente
+Não é um fork
+Não copiou o Bitcoin e mudou o nome. Foi escrita linha por linha em Python, com decisões conscientes:
+
+Schnorr em vez de ECDSA (mais compacto e privado)
+
+Argon2id em vez de PBKDF2 (mais resistente a ASIC)
+
+ChaCha20-Poly1305 em vez de AES-GCM (mais rápido em software)
+
+Não é um token
+Não roda em cima da Ethereum. É layer 1 nativa, com consenso próprio.
+
+Não é centralizada
+Qualquer pessoa pode rodar um nó em casa. Só precisa Python e uma conexão.
+
+É verificável
+Todo o código é aberto no GitHub. Toda a blockchain é auditável com chain_validator. Nada é escondido.
+
+🔮 Próximos passos
+O BRN continua evoluindo:
+
+SPV mode — cliente leve para celular
+
+Relay descentralizado — nenhuma entidade central
+
+Bridge bidirecional — BRN ↔ BTC com assinatura nativa
+
+Interface mobile — carteira em Android/iOS
+
+Testnet pública — para devs testarem apps
+
+💬 Quer participar?
+Só testar
+Baixe o projeto do GitHub
+
+Duplo-clique em iniciar.bat
+
+Digite uma senha
+
+Abra http://127.0.0.1:8080/
+
+Contribuir
+Reporte bugs em Issues
+
+Envie PRs com melhorias
+
+Compartilhe o projeto
+
+📌 Conclusão
+A BRN é uma prova de que blockchain não precisa ser complicado. Com ~20 arquivos Python, você tem:
+
+Uma moeda com 21 milhões de unidades
+
+Uma rede P2P autenticada
+
+Uma carteira HD com BIP39
+
+Um explorador funcionando
+
+Uma ponte para o Bitcoin
+
+Tudo isso rodando no seu PC, sem servidor, sem mensalidade, sem dependência de terceiros.
+
+A BRN não é só uma moeda. É uma aula de como blockchain funciona por dentro.
+
+#BRN #BrunoCoin #Blockchain #Python #Crypto #Layer1 #OpenSource
+
+Quer que eu transforme esse texto em:
+
+Post para LinkedIn (mais formal)
+
+Thread para Twitter/X (mais curto)
+
+Post para Instagram (visual, com emojis)
+
+Artigo para Medium (técnico, longo)
+
+This response is AI-generated, for reference only.
+
 
