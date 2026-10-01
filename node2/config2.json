@@ -1,0 +1,11 @@
+{
+  "web_port": 5001,
+  "explorer_port": 8081,
+  "p2p_port": 6002,
+  "db_path": "brn_v2_chain_node2.db",
+  "miner_enabled": false,
+  "headless": true,
+  "upnp": false,
+  "tracker_url": "http://127.0.0.1:5000",
+  "bootstrap_peers": ["127.0.0.1:6001"]
+}
