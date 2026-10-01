@@ -1,4 +1,201 @@
+# BRN CHAIN v8.1 L2 MINERADO - MANUAL DE AUDITORIA
+Versão: 8.1.0 | Data: 01/10/2026 | Autor: Bruno
 
+## 1. ARQUITETURA GERAL
+
+BRN é uma blockchain PoW com L2 BTC->BRN validado por mineração.
+
+Componentes:
+- L1: blockchain.py (PoW) + db.py (SQLite) + p2p_unified.py
+- L2: btc_watcher.py (RPC-only) + l2_manager.py + contracts/
+- API: server.py + main.py + miner_loop.py
+- Carteira: wallet.py (gera brn1q...)
+
+Fluxo L2 CORRETO que deve ser validado:
+BTC enviado para bc1q -> Blockstream API detecta -> BTC_DETECTED -> add_l2_transaction() -> mempool -> mine_block() -> validate_block() -> RELEASED -> BRN creditado
+
+Fluxo ERRADO que NÃO pode existir:
+BTC detectado -> credit_brn_to_wallet() direto (sem PoW) = VULNERABILIDADE
+
+## 2. ARQUIVOS E RESPONSABILIDADES
+
+### 2.1 db.py v6 - Deve ter:
+- Tabela blocks (height PK, hash, prev_hash, merkle, timestamp, nonce, difficulty)
+- Tabela transactions (txid PK, block_height, data)
+- Tabela utxos (txid, vout, address, amount, spent)
+- Tabela mempool (txid PK, tx_json, fee)
+- Tabela l2_escrows (escrow_id PK, creator, buyer, brn_amount, btc_expected_sats, btc_address, btc_txid, status, created_at, expires_at, l2_hash)
+- Tabela btc_txids (txid PK, escrow_id, used_at) ANTI-REPLAY
+- Tabela l2_txs (escrow_id, btc_txid, buyer)
+
+Métodos obrigatórios:
+- save_l2_escrow(d), get_l2_escrows(status), get_l2_escrow_by_id(id)
+- update_l2_escrow_status(id, status), set_l2_escrow_btc_txid(id, txid)
+- is_btc_txid_used(txid) -> bool, mark_btc_txid_used(txid, escrow_id, btc_address)
+- save_l2_tx(l2_tx), all_mempool(limit), add_mempool(tx, fee), remove_mempool(txid)
+
+Se algum desses não existir, L2 não funciona.
+
+### 2.2 blockchain.py v7.3.0 - VALIDAÇÃO CRÍTICA:
+
+Deve conter:
+- make_l2_coinbase(buyer, pubkey, brn_amount, btc_txid, escrow_id, height)
+  Cria coinbase com signature = f"L2:{btc_txid}:{escrow_id}" e data.l2=True
+
+- add_l2_transaction(l2_tx) - REGRA DE OURO:
+    1. validate_l2_tx() -> escrow existe? status OPEN? buyer bate? brn_amount bate? não expirado? btc_txid não usado?
+    2. mark_btc_txid_used() - anti-replay IMEDIATO
+    3. update_l2_escrow_status -> BTC_DETECTED (NÃO RELEASED)
+    4. set_l2_escrow_btc_txid
+    5. save_l2_tx
+    6. add_mempool(l2_cb) - JOGA PRA MEMPOOL, NÃO APLICA UTXO AINDA
+    7. return txid
+
+  SE essa função chamar apply_tx() ou credit_brn_to_wallet() direto, está ERRADO. Deve só add_mempool.
+
+- credit_brn_to_wallet() deve estar DEPRECATED e levantar Exception.
+
+- validate_tx(tx, height, is_coinbase):
+  Se is_coinbase e signature startswith "L2:":
+    Parse btc_txid, escrow_id
+    Verifica escrow existe no DB
+    Se ok -> return True
+  Senão valida coinbase normal.
+
+- validate_block(block, prev):
+  Deve permitir coinbase maior quando has_l2 = True
+  Deve chamar validate_tx para cada tx, incluindo L2 coinbases
+
+- accept_block(block):
+  Para cada tx com data.l2 == True:
+    update_l2_escrow_status(escrow_id, "RELEASED") <- SÓ AQUI libera BRN
+    apply_tx(tx, height, coinbase=True) <- SÓ AQUI cria UTXO
+  Para tx normal: apply_tx + remove_mempool
+
+- mine_block_interruptible() deve priorizar L2:
+  l2_txs = [t for t in mempool if t.get('data',{}).get('l2')]
+  normal = [t for t in mempool if not l2]
+  selected = l2_txs + normal
+
+Se minerador não prioriza L2, L2 pode demorar.
+
+### 2.3 btc_watcher.py v3 - RPC-ONLY
+
+Deve ser Thread daemon que:
+- A cada 30s chama fetch_via_rpc(address)
+- fetch_via_rpc deve consultar https://blockstream.info/api/address/{addr}/txs e fallback mempool.space
+- Para cada escrow OPEN não expirado:
+    - Se is_btc_txid_used -> skip (anti-replay)
+    - Se value_sats < expected*0.99 -> skip
+    - Se confirmations < BTC_MIN_CONFIRMATIONS (3) -> skip
+    - Se tudo ok: monta l2_tx dict com escrow_id, buyer, brn_amount, btc_txid, btc_address, l2_hash
+    - Chama blockchain.add_l2_transaction(l2_tx) -> NÃO chama credit_brn
+
+Se watcher chamar qualquer função que credita direto, está ERRADO.
+
+### 2.4 btc_config.py
+
+Deve ter:
+BTC_RECEIVE_ADDRESS = "bc1q..." (NÃO pode ser placeholder em produção)
+BTC_NETWORK = "mainnet" ou "testnet"
+BTC_MIN_CONFIRMATIONS = 3
+BRN_PER_BTC = 10000
+FEE_PERCENT = 2
+MIN_BTC_SATS = 10000
+MAX_BTC_SATS = 100_000_000
+
+### 2.5 l2_manager.py
+
+- quote(btc_sats): calcula brn_gross = btc/1e8 * BRN_PER_BTC *1e8, fee = gross*FEE%, net = gross-fee
+- create_order(btc_sats, buyer_brn, creator="BRN_TREASURY"): valida limites, valida buyer startswith brn1, chama factory.create_btc_to_brn
+- get_order(id), list_orders, stats()
+
+### 2.6 contracts/escrow_btc_brn.py e factory.py
+
+EscrowBTCtoBRN deve ter status: OPEN, BTC_DETECTED, RELEASED, CANCELLED, EXPIRED
+Factory deve calcular taxa e salvar via db.save_l2_escrow
+
+### 2.7 main.py v8.1
+
+Deve preservar v6.1:
+- _resolve_password() ordem: --password-file > --password > BRN_NODE_PASSWORD > prompt
+- load_or_create_node_identity() antes do P2P
+- parse_args com --client-mode (auto_genesis=False), --discover, --status, --headless
+- P2PManager(chain, node_id_priv, tcp_port, enable_upnp)
+- Threads: run_http, run_explorer, run_status_loop, run_wallet_main_thread
+- CLIENT_BOOT_TIMEOUT esperando genesis
+- PLUS L2: se args.l2 e L2_ENABLED: BTCWatcher(db, chain).start()
+- se args.mine: get_miner(chain).start()
+
+### 2.8 server.py v8.1
+
+Endpoints que outra IA deve testar:
+GET /api/status -> height, mempool, l2 stats
+GET /api/l2/quote?btc_sats=100000 -> brn_net, fee
+POST /api/l2/create {"btc_sats":100000,"buyer_brn":"brn1q..."} -> escrow_id, btc_address, instructions
+GET /api/l2/order/<id> -> status + status_desc
+GET /api/l2/stats -> open, btc_detected, released
+GET /api/l2/list?buyer=brn1q...&status=OPEN
+
+## 3. CHECKLIST DE SEGURANÇA - OUTRA IA DEVE VERIFICAR
+
+[ ] add_l2_transaction NÃO aplica UTXO direto, só mempool?
+[ ] credit_brn_to_wallet está deprecated e levanta Exception?
+[ ] is_btc_txid_used() chamado ANTES de aceitar BTC?
+[ ] mark_btc_txid_used() chamado imediatamente após validação?
+[ ] BTC_DETECTED!= RELEASED? RELEASED só em accept_block?
+[ ] validate_tx aceita coinbase L2 com signature L2:?
+[ ] fetch_via_rpc checa confirmações >=3?
+[ ] Escrow expira em 24h? cancel_expired() existe?
+[ ] Tolerância 0.99 no valor BTC (pra fee)?
+[ ] Factory valida buyer startswith brn1?
+[ ] Factory valida MIN/MAX BTC?
+[ ] main.py preserva identidade Ed25519 antes do P2P?
+[ ] main.py tem --client-mode com auto_genesis=False?
+[ ] server.py tem CORS e não expõe senha?
+
+## 4. COMO TESTAR MANUALMENTE
+
+1. Configure btc_config.py com seu bc1q de testnet
+2. Rode em testnet: BTC_NETWORK="testnet", use faucet
+3. Teste fluxo completo:
+
+python main.py --l2 --mine --headless
+curl -X POST http://127.0.0.1:5000/api/l2/create -H "Content-Type: application/json" -d '{"btc_sats":10000,"buyer_brn":"brn1qtest..."}'
+# Anote escrow_id e btc_address
+# Envie 0.0001 tBTC para btc_address via faucet
+# Observe logs: [BTC Watcher RPC] BTC CONFIRMADO -> mempool -> [Miner] Bloco contém 1 TXs L2
+curl http://127.0.0.1:5000/api/l2/order/escrow_...
+# Deve ir OPEN -> BTC_DETECTED (mempool) -> RELEASED (após bloco)
+curl http://127.0.0.1:5000/api/balance/brn1qtest...
+# Deve ter saldo 0.098 BRN (se rate 10000)
+
+4. Teste anti-replay:
+Tente enviar mesmo btc_txid duas vezes -> segundo deve falhar is_btc_txid_used
+
+5. Teste expiração:
+Crie escrow, espere 24h ou mude expires_at para passado, chame cancel_expired() -> deve virar EXPIRED
+
+## 5. VULNERABILIDADES CONHECIDAS SE NÃO SEGUIR MANUAL
+
+- Se liberar BRN sem PoW: atacante pode falsificar API e ganhar BRN grátis
+- Se não tiver anti-replay: mesmo BTC TX pode gerar BRN infinitos
+- Se não validar buyer: atacante pode roubar BRN de outro
+- Se não validar brn_amount: atacante pode pedir 1 sat BTC e ganhar 1M BRN
+- Se não checar confirmações: double-spend BTC
+
+## 6. ARQUITETURA RPC DE NÓS
+
+Cada nó precisa:
+- node_identity.enc (Ed25519)
+- config.json com web_port, p2p_port, db_path diferentes
+- BRN_NETWORK_SECRET igual em todos
+- bootstrap_peers apontando para nó origem
+
+Nó origem: python main.py --l2 --mine (cria genesis)
+Nó cliente: python main.py --client-mode --l2 --config config2.json (espera genesis)
+
+Verificação: curl http://127.0.0.1:5000/api/status e 5001 devem ter mesma height e tip.
 📖 Manual BRN — Dois Cliques e Pronto
 🎯 O que você vai fazer
 Baixar o BRN do GitHub
