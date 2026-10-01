@@ -1,21 +1,33 @@
 # contracts/escrow_btc_brn.py - Contrato pronto BTC -> BRN
-import time, hashlib, uuid, json
+# Esse contrato roda em L2, só o hash vai pra L1
+import time
+import hashlib
+import uuid
+import json
 
 class EscrowBTCtoBRN:
     def __init__(self, creator_wallet, brn_amount_sats, btc_expected_sats, btc_address, buyer_wallet=None):
+        """
+        creator_wallet: sua carteira que tem BRN (ex: BRN_TREASURY)
+        brn_amount_sats: quanto BRN vai liberar (em sats BRN, 8 decimais)
+        btc_expected_sats: quanto BTC espera receber (em sats BTC)
+        btc_address: seu endereço BTC bc1q...
+        buyer_wallet: carteira BRN do comprador brn1q...
+        """
         self.escrow_id = f"escrow_{uuid.uuid4().hex[:12]}"
         self.creator = creator_wallet
         self.buyer = buyer_wallet
-        self.brn_amount = int(brn_amount_sats)
+        self.brn_amount = int(brn_amount_sats)  # em sats BRN (8 decimais)
         self.btc_expected = int(btc_expected_sats)
         self.btc_address = btc_address
         self.btc_txid = None
-        self.status = "OPEN"
+        self.status = "OPEN"  # OPEN, BTC_DETECTED, RELEASED, CANCELLED, EXPIRED
         self.created_at = int(time.time())
-        self.expires_at = self.created_at + 3600*24
+        self.expires_at = self.created_at + 86400  # 24h
         self.l2_hash = self._calc_hash()
 
     def _calc_hash(self):
+        """Hash que vai pra L1 - economiza 90% de espaço"""
         data = f"{self.escrow_id}{self.brn_amount}{self.btc_expected}{self.btc_address}{self.created_at}"
         return hashlib.sha256(data.encode()).hexdigest()
 
@@ -36,6 +48,7 @@ class EscrowBTCtoBRN:
         }
 
     def to_l1_tx(self):
+        """O que vai pra blockchain BRN L1 (só o hash, economia de espaço)"""
         return {
             "type": "l2_settlement",
             "subtype": "btc_to_brn",
@@ -45,3 +58,15 @@ class EscrowBTCtoBRN:
             "status": self.status,
             "timestamp": int(time.time())
         }
+
+    def is_expired(self):
+        return int(time.time()) > self.expires_at
+
+    @staticmethod
+    def from_dict(d):
+        obj = EscrowBTCtoBRN.__new__(EscrowBTCtoBRN)
+        obj.__dict__.update(d)
+        return obj
+
+    def __repr__(self):
+        return f"<Escrow {self.escrow_id} {self.status} {self.brn_amount/1e8} BRN por {self.btc_expected/1e8} BTC buyer={self.buyer[:10] if self.buyer else 'None'}...>"
