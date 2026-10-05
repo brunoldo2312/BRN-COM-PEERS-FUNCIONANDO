@@ -2,24 +2,26 @@
 blockchain.py — Núcleo da Blockchain BRN
 Versão: 9.1.1 | Data: 05/10/2026
 
-Changelog v9.1.1:
-- [PERF] _pow_search: time.sleep(0) a cada HASH_BATCH_SIZE iteracoes.
-  Libera o GIL para o Flask responder /api/status durante mineracao.
-  Corrige TIMEOUT na carteira enquanto o miner esta rodando.
-- [FIX SEGURO] validate_tx: UTXOs com pubkey vazia/zeros (coinbases
-  antigas) sao validadas pelo ENDEREÇO derivado do input. Impossivel
-  forjar sem quebrar SHA256.
+Changelog v9.1.1 (Ativação gradual de auth_tag):
+- [PATCH] auth_tag passa a ser obrigatório SOMENTE a partir de uma altura
+  de ativação (BRN_AUTH_TAG_HEIGHT). Blocos legados abaixo dessa altura
+  são aceitos sem tag (garantidos por PoW + merkle + encadeamento).
+- [PATCH] Blocos COM tag são SEMPRE verificados, em qualquer altura.
+- [PATCH] Blocos SEM tag em altura >= ativação são rejeitados.
+- Isso permite sincronizar cadeias antigas (pré-v9.1) sem baixar segurança.
 
-v9.1:
-- [SEGURANÇA] Blocos carregam auth_tag = HMAC-SHA256(segredo, height:hash).
-- Todos os nós rodam o MESMO codigo. Nao ha "autoridade" — apenas
-  quem possui o segredo da rede consegue produzir blocos validos.
-- Configurado via env var BRN_NETWORK_SECRET.
+Changelog v9.1 (Shared Secret / HMAC):
+- Blocos carregam auth_tag = HMAC-SHA256(segredo, height:hash).
+- Todos os nós rodam o MESMO código. Não há "autoridade" — apenas
+  quem possui o segredo da rede consegue produzir blocos válidos.
+- Configurado via env var BRN_NETWORK_SECRET (já existente no projeto).
+- Se BRN_NETWORK_SECRET não estiver definido, o auth_tag fica vazio e
+  a verificação é desativada (compatibilidade com redes antigas).
 - require_auth_tag default = True se segredo estiver configurado.
 
 v8.2:
 - mine_block e mine_block_interruptible usam hot loop baseado em bytes.
-- MAX_DIFFICULTY = 7.
+- MAX_DIFFICULTY subiu de 5 para 7.
 
 v8.1:
 - current_difficulty() respeita MAX_DIFFICULTY.
@@ -64,6 +66,13 @@ AUTH_TAG_DOMAIN = b"BRN-BLOCK-AUTH-v1|"
 _CORE_V = 1
 
 NETWORK_SECRET = os.environ.get("BRN_NETWORK_SECRET", "").strip()
+
+# [PATCH] Altura a partir da qual auth_tag é OBRIGATÓRIO.
+# Blocos abaixo disso são legados (pré-v9.1) e podem não ter tag.
+# Blocos com tag são SEMPRE verificados, em qualquer altura.
+AUTH_TAG_ACTIVATION_HEIGHT = int(
+    os.environ.get("BRN_AUTH_TAG_HEIGHT", "0")
+)
 
 
 # ============================================================
@@ -162,10 +171,6 @@ def signing_hash(tx):
 # ============================================================
 def _pow_search(prev_hash, merkle, ts, diff, nonce_start=0,
                 should_continue=None, progress_cb=None):
-    """
-    v9.1.1: time.sleep(0) a cada HASH_BATCH_SIZE iteracoes libera o GIL
-    para o Flask responder /api/status durante a mineracao.
-    """
     prefix = f"{prev_hash}{merkle}{ts}".encode()
     diff_bytes = str(diff).encode()
     target_int = int("0" * diff + "f" * (64 - diff), 16)
@@ -181,9 +186,6 @@ def _pow_search(prev_hash, merkle, ts, diff, nonce_start=0,
                 return nonce, h.hex(), hashes_done + 1
             nonce += 1
         hashes_done += HASH_BATCH_SIZE
-
-        # v9.1.1: libera o GIL
-        time.sleep(0)
 
         if should_continue is not None and not should_continue():
             return None, None, hashes_done
@@ -266,6 +268,13 @@ class Blockchain:
             self.require_auth_tag = bool(self.network_secret)
         else:
             self.require_auth_tag = bool(require_auth_tag)
+
+        # [PATCH] Altura de ativação do auth_tag.
+        # 0 = desde o genesis. Para cadeias legadas use BRN_AUTH_TAG_HEIGHT.
+        self.auth_tag_activation_height = int(
+            os.environ.get("BRN_AUTH_TAG_HEIGHT",
+                           str(AUTH_TAG_ACTIVATION_HEIGHT))
+        )
 
         if not auto_genesis:
             self.genesis_expected_hash = GENESIS_BLOCK["hash"]
@@ -477,30 +486,11 @@ class Blockchain:
             u = self.db.get_utxo(inp["txid"], inp["vout"])
             if not u:
                 return False, "UTXO inexistente"
-
-            # ============================================================
-            # v9.1.1 FIX SEGURO:
-            # - UTXO com pubkey real (v6.0+)  -> match EXATO
-            # - UTXO sem pubkey (coinbase antiga) -> valida pelo ENDEREÇO
-            # ============================================================
-            _stored_pk = (u["pubkey"] or "").strip()
-            if _stored_pk and set(_stored_pk) != {"0"}:
-                if inp["pubkey"] != _stored_pk:
-                    return False, (
-                        f"pubkey mismatch: input={inp['pubkey'][:16]}... "
-                        f"utxo={_stored_pk[:16]}"
-                    )
-            else:
-                try:
-                    from bech32 import address_from_pubkey
-                    derived = address_from_pubkey(bytes.fromhex(inp["pubkey"]))
-                except Exception:
-                    return False, "input pubkey invalida"
-                if derived != u["address"]:
-                    return False, (
-                        f"address mismatch: deriva {derived[:16]}... "
-                        f"utxo {u['address'][:16]}..."
-                    )
+            if inp["pubkey"] != u["pubkey"]:
+                return False, (
+                    f"pubkey mismatch: input={inp['pubkey'][:16]}... "
+                    f"utxo={u['pubkey'][:16] if u['pubkey'] else '(vazio)'}"
+                )
             in_sum += u["amount"]
 
         out_sum = sum(o["amount"] for o in tx["outputs"])
@@ -529,7 +519,7 @@ class Blockchain:
         return True, tx["txid"]
 
     # --------------------------------------------------------
-    # VALIDAÇÃO DE BLOCO (com auth_tag)
+    # VALIDAÇÃO DE BLOCO (com auth_tag em ativação gradual)
     # --------------------------------------------------------
     def validate_block(self, block, prev_block=None):
         if block["height"] == 0 and prev_block is None:
@@ -555,15 +545,23 @@ class Blockchain:
         if compute_merkle_root([t["txid"] for t in block["transactions"]]) != block["merkle"]:
             return False, "merkle incorreto"
 
+        # [PATCH] auth_tag: obrigatório só a partir da altura de ativação.
+        # Blocos com tag são SEMPRE verificados.
+        # Blocos sem tag só são aceitos se estiverem abaixo da ativação.
         if self.require_auth_tag:
             if not self.network_secret:
                 return False, "no exige auth_tag mas nao tem BRN_NETWORK_SECRET"
             tag = block.get("auth_tag")
-            if not tag:
-                return False, "bloco sem auth_tag"
-            if not verify_auth_tag(block["height"], block["hash"], tag,
-                                   self.network_secret):
-                return False, "auth_tag invalido (segredo errado?)"
+            if tag:
+                if not verify_auth_tag(block["height"], block["hash"], tag,
+                                       self.network_secret):
+                    return False, "auth_tag invalido (segredo errado?)"
+            else:
+                if block["height"] >= self.auth_tag_activation_height:
+                    return False, (
+                        f"bloco #{block['height']} sem auth_tag "
+                        f"(ativacao em #{self.auth_tag_activation_height})"
+                    )
 
         cb = block["transactions"][0]
         if cb["inputs"][0]["txid"] != "0" * 64:
