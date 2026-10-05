@@ -1,44 +1,101 @@
 """
-brn_tailscale_setup.py — Configura rede Tailscale para o BRN
-=============================================================
-Resolve o problema de VLANs separadas criando uma VPN mesh
-entre as maquinas. Depois de configurado, funciona de qualquer
-rede (VLAN, internet, celular, etc).
+brn_tailscale_setup.py - Setup idempotente do Tailscale para o BRN
+==================================================================
 
-Uso:
+Este script resolve o problema de VLANs separadas criando uma VPN
+mesh (Tailscale) entre as maquinas que rodam o no BRN.
+
+Modos de uso:
+
     python brn_tailscale_setup.py
+        Modo interativo. Faz o setup inicial:
+        - Instala o Tailscale (se necessario)
+        - Faz login
+        - Descobre o IP Tailscale desta maquina
+        - Pede o IP do outro PC
+        - Salva em brn_tailscale_peer.txt
+        - Atualiza bootstrap_peers.json
+
+    python brn_tailscale_setup.py --auto
+        Modo automatico. Usado no startup do no:
+        - Verifica Tailscale instalado e autenticado
+        - Le brn_tailscale_peer.txt
+        - Atualiza bootstrap_peers.json se algo mudou
+        - Exit 0 se tudo OK, 1 se precisa atencao
+
+    python brn_tailscale_setup.py --check
+        So verifica o estado atual. Nao modifica nada.
+
+Arquivos usados:
+
+    brn_tailscale_peer.txt
+        Uma linha por peer (IP:porta).
+        Exemplo: 100.64.1.42:6001
+
+    bootstrap_peers.json
+        Atualizado automaticamente com o peer acima.
 """
 import os
 import sys
 import json
-import shutil
 import subprocess
 import platform
 from pathlib import Path
 
-BOOTSTRAP_FILE = Path(__file__).parent / "bootstrap_peers.json"
+# ============================================================
+# CONFIGURACOES
+# ============================================================
+BASE = Path(__file__).parent
+BOOTSTRAP_FILE = BASE / "bootstrap_peers.json"
+PEER_FILE = BASE / "brn_tailscale_peer.txt"
 P2P_PORT = 6001
 
+TAILSCALE_WINDOWS_PATHS = [
+    r"C:\Program Files\Tailscale\tailscale.exe",
+    r"C:\Program Files (x86)\Tailscale\tailscale.exe",
+]
+
 
 # ============================================================
-# HELPERS
+# HELPERS DE LOG
 # ============================================================
-def banner(txt):
-    print()
-    print("=" * 60)
-    print(f"  {txt}")
-    print("=" * 60)
+def log(tag, msg):
+    print("[" + tag + "] " + msg, flush=True)
 
 
-def run(cmd, capture=True):
+def info(msg):
+    log("i", msg)
+
+
+def ok(msg):
+    log("ok", msg)
+
+
+def warn(msg):
+    log("!", msg)
+
+
+def err(msg):
+    log("X", msg)
+
+
+# ============================================================
+# HELPERS DE SISTEMA
+# ============================================================
+def run(cmd, capture=True, timeout=30):
+    """Roda um comando e retorna (returncode, output)."""
     try:
         r = subprocess.run(
-            cmd, shell=True,
+            cmd,
+            shell=True,
             stdout=subprocess.PIPE if capture else None,
             stderr=subprocess.STDOUT if capture else None,
             text=True,
+            timeout=timeout,
         )
         return r.returncode, (r.stdout or "").strip()
+    except subprocess.TimeoutExpired:
+        return -2, "timeout"
     except Exception as e:
         return -1, str(e)
 
@@ -52,25 +109,33 @@ def is_linux():
 
 
 # ============================================================
-# 1) DETECTA SE TAILSCALE JA ESTA INSTALADO
+# HELPERS DO TAILSCALE
 # ============================================================
-def tailscale_installed():
+def tailscale_path():
+    """
+    Retorna o comando para invocar o Tailscale.
+    Prefere o PATH. Se nao achar, procura nos caminhos default do Windows.
+    Retorna None se nao instalado.
+    """
     rc, _ = run("tailscale version")
-    return rc == 0
+    if rc == 0:
+        return "tailscale"
+
+    if is_windows():
+        for p in TAILSCALE_WINDOWS_PATHS:
+            if os.path.exists(p):
+                return '"' + p + '"'
+
+    return None
 
 
-def tailscale_running():
-    rc, out = run("tailscale status")
-    if rc != 0:
-        return False
-    return "Logged out" not in out and "not logged in" not in out.lower()
-
-
-def tailscale_ip():
-    rc, out = run("tailscale ip -4")
+def tailscale_ip(ts_cmd):
+    """
+    Retorna o IP Tailscale da maquina (100.x.x.x) ou string vazia.
+    """
+    rc, out = run(ts_cmd + " ip -4")
     if rc != 0:
         return ""
-    # Pode retornar vários IPs (um por linha). Pega o primeiro 100.x
     for line in out.splitlines():
         line = line.strip()
         if line.startswith("100."):
@@ -78,193 +143,350 @@ def tailscale_ip():
     return ""
 
 
-# ============================================================
-# 2) INSTALA TAILSCALE
-# ============================================================
-def install_tailscale():
-    banner("INSTALANDO TAILSCALE")
-
-    if is_linux():
-        print("[*] Ubuntu/Linux detectado")
-        print("[*] Rodando instalador oficial...")
-        print()
-        rc, out = run(
-            "curl -fsSL https://tailscale.com/install.sh | sh",
-            capture=False,
-        )
-        if rc != 0:
-            print()
-            print("[X] Falha na instalacao.")
-            print("    Se pediu sudo, rode manualmente:")
-            print("      curl -fsSL https://tailscale.com/install.sh | sh")
-            return False
-        print()
-        print("[ok] Tailscale instalado")
-        return True
-
-    if is_windows():
-        print("[!] Windows detectado")
-        print()
-        print("    Instale manualmente:")
-        print("      1. Abra https://tailscale.com/download/windows")
-        print("      2. Baixe e instale o MSI")
-        print("      3. Faca login com a mesma conta do Ubuntu")
-        print("      4. Rode este script de novo")
-        print()
+def tailscale_authenticated(ts_cmd):
+    """
+    Verifica se o Tailscale esta logado.
+    """
+    rc, out = run(ts_cmd + " status")
+    if rc != 0:
         return False
-
-    print("[X] Sistema nao suportado automaticamente.")
-    return False
-
-
-# ============================================================
-# 3) SOBE TAILSCALE
-# ============================================================
-def start_tailscale():
-    banner("AUTENTICANDO TAILSCALE")
-
-    if is_linux():
-        print("[*] Rodando 'sudo tailscale up'...")
-        print()
-        print("    IMPORTANTE:")
-        print("    1. Vai abrir uma URL no terminal.")
-        print("    2. Copie e cole no navegador.")
-        print("    3. Faca login com sua conta (Google/GitHub/etc).")
-        print("    4. Autorize o dispositivo.")
-        print()
-        rc, _ = run("sudo tailscale up", capture=False)
-        if rc != 0:
-            print("[X] Falha. Rode manualmente: sudo tailscale up")
-            return False
-        return True
-
-    if is_windows():
-        print("[i] No Windows, abra o Tailscale no menu Iniciar e faca login.")
-        print("    Depois rode este script de novo.")
+    out_l = out.lower()
+    if "logged out" in out_l:
         return False
-
-    return False
+    if "not logged in" in out_l:
+        return False
+    return True
 
 
 # ============================================================
-# 4) ATUALIZA BOOTSTRAP_PEERS.JSON
+# HELPERS DE ARQUIVO
 # ============================================================
-def update_bootstrap(own_ip):
-    banner("ATUALIZANDO BOOTSTRAP_PEERS.JSON")
+def read_peer_file():
+    """
+    Le IPs do peer em brn_tailscale_peer.txt.
+    Retorna lista de strings IP:porta.
+    """
+    if not PEER_FILE.exists():
+        return []
+    peers = []
+    try:
+        content = PEER_FILE.read_text(encoding="utf-8-sig")
+    except Exception:
+        try:
+            content = PEER_FILE.read_text(encoding="latin-1")
+        except Exception:
+            return []
 
-    # Le existente
+    for line in content.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if ":" not in line:
+            line = line + ":" + str(P2P_PORT)
+        peers.append(line)
+    return peers
+
+
+def update_bootstrap(own_ip, peer_ips):
+    """
+    Escreve bootstrap_peers.json com o peer + proprio IP.
+    Retorna True se o arquivo mudou.
+    """
     existing = []
     if BOOTSTRAP_FILE.exists():
         try:
-            existing = json.loads(BOOTSTRAP_FILE.read_text())
+            existing = json.loads(BOOTSTRAP_FILE.read_text(encoding="utf-8-sig"))
         except Exception:
             existing = []
 
-    print(f"IP Tailscale desta maquina: {own_ip}")
-    print()
-    print("Cole os IPs Tailscale das OUTRAS maquinas (separados por espaco).")
-    print("Exemplo: 100.64.1.42 100.64.1.43")
-    print("(deixe em branco para manter o bootstrap atual)")
-    print()
-    entry = input("IPs: ").strip()
+    if not isinstance(existing, list):
+        existing = []
 
-    if not entry:
-        print("[i] Nada a fazer.")
-        return
+    entries = set()
+    for e in existing:
+        if isinstance(e, str):
+            entries.add(e)
 
-    others = [ip.strip() for ip in entry.split() if ip.strip().startswith("100.")]
+    for ip in peer_ips:
+        entries.add(ip)
 
-    new_entries = set(existing)
-    for ip in others:
-        new_entries.add(f"{ip}:{P2P_PORT}")
-
-    # Adiciona proprio IP se nao estiver (para descoberta local)
     if own_ip:
-        new_entries.add(f"{own_ip}:{P2P_PORT}")
+        entries.add(own_ip + ":" + str(P2P_PORT))
 
-    new_list = sorted(new_entries)
+    new_list = sorted(entries)
 
-    print()
-    print("Novo bootstrap_peers.json:")
-    for e in new_list:
-        print(f"  - {e}")
+    if new_list == sorted(entries - set(peer_ips) - ({own_ip + ":" + str(P2P_PORT)} if own_ip else set())) and len(new_list) == len(existing):
+        pass
+
+    if new_list == sorted([e for e in existing if isinstance(e, str)]):
+        return False
 
     try:
         BOOTSTRAP_FILE.write_text(
             json.dumps(new_list, indent=2),
             encoding="utf-8",
         )
-        print()
-        print("[ok] Salvo. Reinicie o no BRN para aplicar.")
+        return True
     except Exception as e:
-        print(f"[X] Erro: {e}")
+        err("Erro salvando bootstrap: " + str(e))
+        return False
+
+
+# ============================================================
+# MODO AUTO (usado no startup)
+# ============================================================
+def mode_auto():
+    """
+    Roda sem interacao. Exit codes:
+        0 = tudo OK, main.py pode subir
+        1 = precisa acao manual (usuario deve rodar sem --auto)
+    """
+    ts = tailscale_path()
+    if not ts:
+        err("Tailscale NAO instalado")
+        info("Rode: python brn_tailscale_setup.py  (sem --auto)")
+        return 1
+
+    if not tailscale_authenticated(ts):
+        err("Tailscale nao autenticado")
+        if is_windows():
+            info("Abra o Tailscale no menu Iniciar e faca login.")
+        else:
+            info("Rode: sudo tailscale up")
+        return 1
+
+    own_ip = tailscale_ip(ts)
+    if not own_ip:
+        err("Nao consegui obter IP Tailscale")
+        info("Rode: " + ts + " ip -4")
+        return 1
+    ok("IP Tailscale: " + own_ip)
+
+    peer_ips = read_peer_file()
+    if not peer_ips:
+        warn("Arquivo " + PEER_FILE.name + " nao existe ou esta vazio")
+        info("Crie com o IP Tailscale do outro PC:")
+        if is_windows():
+            info('   echo 100.64.1.42:6001 > ' + PEER_FILE.name)
+        else:
+            info('   echo 100.64.1.42:6001 > ' + PEER_FILE.name)
+        return 1
+
+    info("Peers: " + ", ".join(peer_ips))
+
+    changed = update_bootstrap(own_ip, peer_ips)
+    if changed:
+        ok("bootstrap_peers.json atualizado")
+    else:
+        ok("bootstrap_peers.json ja estava correto")
+
+    return 0
+
+
+# ============================================================
+# MODO CHECK
+# ============================================================
+def mode_check():
+    """
+    Mostra o estado atual sem modificar nada.
+    """
+    print()
+    print("=" * 60)
+    print("  BRN - Tailscale Status")
+    print("=" * 60)
+    print()
+
+    ts = tailscale_path()
+    if ts:
+        print("  Tailscale instalado : SIM")
+        print("  Comando             : " + ts)
+
+        if tailscale_authenticated(ts):
+            print("  Autenticado         : SIM")
+            ip = tailscale_ip(ts)
+            print("  IP Tailscale        : " + (ip if ip else "(nenhum)"))
+        else:
+            print("  Autenticado         : NAO")
+            print("  (rode 'tailscale up' para autenticar)")
+    else:
+        print("  Tailscale instalado : NAO")
+
+    print()
+
+    peers = read_peer_file()
+    print("  Peers configurados  : " + str(len(peers)))
+    for p in peers:
+        print("    - " + p)
+
+    print()
+
+    if BOOTSTRAP_FILE.exists():
+        print("  bootstrap_peers.json: existe")
+        try:
+            content = json.loads(BOOTSTRAP_FILE.read_text(encoding="utf-8-sig"))
+            for c in content:
+                print("    - " + str(c))
+        except Exception as e:
+            print("    (erro lendo: " + str(e) + ")")
+    else:
+        print("  bootstrap_peers.json: NAO existe")
+
+    print()
+    return 0
+
+
+# ============================================================
+# MODO INTERATIVO (setup inicial)
+# ============================================================
+def mode_interactive():
+    """
+    Fluxo interativo para primeira configuracao.
+    """
+    print()
+    print("=" * 60)
+    print("  BRN - Setup do Tailscale (interativo)")
+    print("=" * 60)
+    print()
+
+    # --- 1) Verifica instalacao ---
+    ts = tailscale_path()
+    if not ts:
+        err("Tailscale NAO instalado")
+        print()
+        if is_windows():
+            print("  Baixe em: https://tailscale.com/download/windows")
+            print("  Depois de instalar, rode este script de novo.")
+            print()
+        elif is_linux():
+            print("  Para instalar no Ubuntu/Linux, rode:")
+            print()
+            print("    curl -fsSL https://tailscale.com/install.sh | sh")
+            print()
+            print("  Depois rode este script de novo.")
+            print()
+        else:
+            print("  Baixe em: https://tailscale.com/download")
+            print()
+        return 1
+    ok("Tailscale instalado")
+
+    # --- 2) Verifica autenticacao ---
+    if not tailscale_authenticated(ts):
+        warn("Tailscale nao autenticado")
+        print()
+        if is_windows():
+            print("  Abra o Tailscale no menu Iniciar e faca login.")
+            print("  (use a MESMA conta do outro PC)")
+        elif is_linux():
+            print("  Rodando 'sudo tailscale up'...")
+            print("  Uma URL vai aparecer. Copie no navegador e autorize.")
+            print()
+            subprocess.run("sudo tailscale up", shell=True)
+        print()
+        try:
+            input("  Pressione ENTER depois de fazer login...")
+        except EOFError:
+            return 1
+
+    if not tailscale_authenticated(ts):
+        err("Ainda nao autenticado. Abortando.")
+        return 1
+    ok("Tailscale autenticado")
+
+    # --- 3) Pega IP proprio ---
+    own_ip = tailscale_ip(ts)
+    if not own_ip:
+        err("Nao consegui obter IP Tailscale.")
+        info("Rode manualmente: " + ts + " ip -4")
+        return 1
+
+    print()
+    print("  ------------------------------------------")
+    print("  SEU IP TAILSCALE: " + own_ip)
+    print("  ------------------------------------------")
+    print()
+    print("  Anote este IP. Voce vai precisar dele no OUTRO PC.")
+    print()
+
+    # --- 4) Pede IP do peer ---
+    print("  Agora cole o IP Tailscale do OUTRO computador.")
+    print("  (no outro PC, rode 'tailscale ip -4' para descobrir)")
+    print()
+
+    try:
+        peer = input("  IP do peer (ex: 100.64.1.42): ").strip()
+    except EOFError:
+        return 1
+
+    if not peer:
+        warn("Vazio. Nada a fazer.")
+        return 1
+
+    # Limpa possiveis espacos
+    peer = peer.replace(" ", "").replace("\t", "")
+
+    if ":" not in peer:
+        peer = peer + ":" + str(P2P_PORT)
+
+    # --- 5) Salva peer ---
+    try:
+        PEER_FILE.write_text(peer + "\n", encoding="utf-8")
+        ok("Salvo em " + PEER_FILE.name + ": " + peer)
+    except Exception as e:
+        err("Erro salvando " + PEER_FILE.name + ": " + str(e))
+        return 1
+
+    # --- 6) Atualiza bootstrap ---
+    if update_bootstrap(own_ip, [peer]):
+        ok("bootstrap_peers.json atualizado")
+    else:
+        info("bootstrap_peers.json ja estava correto")
+
+    # --- 7) Instrucoes finais ---
+    print()
+    print("=" * 60)
+    print("  CONFIGURACAO CONCLUIDA")
+    print("=" * 60)
+    print()
+    print("  Seu IP Tailscale : " + own_ip)
+    print("  Peer configurado : " + peer)
+    print()
+    print("  IMPORTANTE: faca a mesma configuracao no outro PC,")
+    print("  usando o SEU IP (" + own_ip + ") como peer.")
+    print()
+    print("  Depois, reinicie o no BRN:")
+    if is_windows():
+        print("    iniciar.bat")
+    else:
+        print("    ./brn.sh")
+    print()
+
+    return 0
 
 
 # ============================================================
 # MAIN
 # ============================================================
 def main():
-    banner("BRN — CONFIGURACAO DE TAILSCALE")
+    args = sys.argv[1:]
 
-    print("Este script resolve VLANs separadas usando Tailscale.")
-    print("Tailscale cria uma VPN mesh entre suas maquinas.")
-    print()
-
-    # 1. Instalado?
-    if not tailscale_installed():
-        print("[!] Tailscale NAO instalado")
-        if not install_tailscale():
-            print()
-            print("Apos instalar, rode este script novamente.")
-            return 1
-        print()
-        print("Rode este script de novo para continuar.")
+    if "--help" in args or "-h" in args:
+        print(__doc__)
         return 0
 
-    print("[ok] Tailscale instalado")
+    if "--auto" in args:
+        return mode_auto()
 
-    # 2. Autenticado?
-    if not tailscale_running():
-        print("[!] Tailscale nao esta autenticado")
-        if not start_tailscale():
-            return 1
-        print()
-        print("Apos autorizar, rode este script novamente.")
-        return 0
+    if "--check" in args:
+        return mode_check()
 
-    print("[ok] Tailscale autenticado")
-
-    # 3. Pega o IP
-    own_ip = tailscale_ip()
-    if not own_ip:
-        print("[X] Nao consegui obter o IP Tailscale.")
-        print("    Rode manualmente: tailscale ip -4")
-        return 1
-
-    banner("SUCESSO")
-    print(f"IP Tailscale desta maquina: {own_ip}")
-    print()
-    print("INSTRUCOES:")
-    print()
-    print("1. No OUTRO computador, rode este script tambem.")
-    print(f"   Ele vai mostrar um IP Tailscale parecido (100.x.x.x).")
-    print()
-    print(f"2. Volte aqui e adicione o IP do outro no bootstrap_peers.json")
-    print()
-    print("3. Reinicie o no BRN nas duas maquinas")
-
-    # 4. Atualiza bootstrap
-    print()
-    resp = input("Deseja atualizar o bootstrap_peers.json agora? (S/n): ").strip().lower()
-    if resp != "n":
-        update_bootstrap(own_ip)
-
-    return 0
+    return mode_interactive()
 
 
 if __name__ == "__main__":
     try:
         sys.exit(main())
     except KeyboardInterrupt:
-        print("\n\n[!] Cancelado pelo usuario.")
+        print()
+        print("Cancelado.")
         sys.exit(130)
