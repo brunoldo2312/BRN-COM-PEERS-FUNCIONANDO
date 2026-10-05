@@ -1,27 +1,26 @@
 """
 blockchain.py — Núcleo da Blockchain BRN
-Versão: 9.1.1 | Data: 05/10/2026
+Versão: 9.1.4 | Data: 05/10/2026
 
-Changelog v9.1.1 (Ativação gradual de auth_tag):
-- [PATCH] auth_tag passa a ser obrigatório SOMENTE a partir de uma altura
-  de ativação (BRN_AUTH_TAG_HEIGHT). Blocos legados abaixo dessa altura
-  são aceitos sem tag (garantidos por PoW + merkle + encadeamento).
-- [PATCH] Blocos COM tag são SEMPRE verificados, em qualquer altura.
-- [PATCH] Blocos SEM tag em altura >= ativação são rejeitados.
-- Isso permite sincronizar cadeias antigas (pré-v9.1) sem baixar segurança.
+Changelog v9.1.4:
+- [SEGURANÇA] CHECKPOINTS ASSINADOS: a cada CHECKPOINT_INTERVAL (1000)
+  blocos, o no-origem assina o hash do bloco com sua chave Ed25519.
+  Todos os nos verificam a assinatura antes de aceitar blocos naquela
+  altura. Reorg nao pode violar nenhum checkpoint conhecido.
 
-Changelog v9.1 (Shared Secret / HMAC):
-- Blocos carregam auth_tag = HMAC-SHA256(segredo, height:hash).
-- Todos os nós rodam o MESMO código. Não há "autoridade" — apenas
-  quem possui o segredo da rede consegue produzir blocos válidos.
-- Configurado via env var BRN_NETWORK_SECRET (já existente no projeto).
-- Se BRN_NETWORK_SECRET não estiver definido, o auth_tag fica vazio e
-  a verificação é desativada (compatibilidade com redes antigas).
-- require_auth_tag default = True se segredo estiver configurado.
+v9.1.3:
+- [COMPAT] auth_tag so e obrigatorio a partir de AUTH_TAG_START_HEIGHT (6000).
+
+v9.1.1:
+- [PERF] _pow_search: time.sleep(0) a cada HASH_BATCH_SIZE iteracoes.
+- [FIX SEGURO] validate_tx: UTXOs com pubkey vazia/zeros validadas por endereco.
+
+v9.1:
+- [SEGURANÇA] Blocos carregam auth_tag = HMAC-SHA256(segredo, height:hash).
 
 v8.2:
 - mine_block e mine_block_interruptible usam hot loop baseado em bytes.
-- MAX_DIFFICULTY subiu de 5 para 7.
+- MAX_DIFFICULTY = 7.
 
 v8.1:
 - current_difficulty() respeita MAX_DIFFICULTY.
@@ -55,6 +54,12 @@ MAX_REORG_DEPTH = 100
 
 HASH_BATCH_SIZE = 5000
 
+# v9.1.3: auth_tag obrigatorio apenas acima desta altura (cadeia legada abaixo)
+AUTH_TAG_START_HEIGHT = 6000
+
+# v9.1.4: checkpoints assinados
+CHECKPOINT_INTERVAL = 1000
+
 GENESIS_PREV = "0" * 64
 GENESIS_TIMESTAMP = 1700000000
 GENESIS_REWARD = INITIAL_REWARD
@@ -67,12 +72,77 @@ _CORE_V = 1
 
 NETWORK_SECRET = os.environ.get("BRN_NETWORK_SECRET", "").strip()
 
-# [PATCH] Altura a partir da qual auth_tag é OBRIGATÓRIO.
-# Blocos abaixo disso são legados (pré-v9.1) e podem não ter tag.
-# Blocos com tag são SEMPRE verificados, em qualquer altura.
-AUTH_TAG_ACTIVATION_HEIGHT = int(
-    os.environ.get("BRN_AUTH_TAG_HEIGHT", "0")
-)
+
+# ============================================================
+# v9.1.4: CHECKPOINTS ASSINADOS (estado global)
+# ============================================================
+_checkpoints = {}             # {str(height): {height, hash, sig, pub, ts}}
+_checkpoint_priv = None       # Ed25519PrivateKey do no-origem
+
+
+def set_checkpoints(d: dict):
+    """Chamado pelo main.py no boot para carregar os checkpoints."""
+    global _checkpoints
+    _checkpoints = {str(k): v for k, v in (d or {}).items()}
+
+
+def set_checkpoint_priv(priv):
+    """Habilita a assinatura de novos checkpoints (so no-origem)."""
+    global _checkpoint_priv
+    _checkpoint_priv = priv
+
+
+def get_checkpoints() -> dict:
+    return dict(_checkpoints)
+
+
+def _verify_checkpoint_for_block(block) -> tuple:
+    """
+    Se existir checkpoint para esta altura, o hash TEM que bater.
+    Retorna (ok, motivo).
+    """
+    cp = _checkpoints.get(str(block["height"]))
+    if not cp:
+        return True, ""
+    if cp.get("hash") != block["hash"]:
+        return False, (
+            f"checkpoint mismatch em #{block['height']} "
+            f"(esperado {str(cp.get('hash'))[:16]}..., "
+            f"recebido {block['hash'][:16]}...)"
+        )
+    try:
+        from checkpoints import verify_checkpoint
+        if not verify_checkpoint(cp):
+            return False, f"checkpoint invalido em #{block['height']}"
+    except ImportError:
+        pass
+    except Exception as e:
+        return False, f"checkpoint verify erro em #{block['height']}: {e}"
+    return True, ""
+
+
+def _maybe_sign_checkpoint(block):
+    """Se for altura multipla de CHECKPOINT_INTERVAL, assina."""
+    if _checkpoint_priv is None:
+        return
+    try:
+        h = int(block["height"])
+    except Exception:
+        return
+    if h == 0 or h % CHECKPOINT_INTERVAL != 0:
+        return
+    try:
+        from checkpoints import sign_checkpoint, save_checkpoints
+        cp = sign_checkpoint(h, block["hash"], _checkpoint_priv)
+        if not cp:
+            return
+        _checkpoints[str(h)] = cp
+        save_checkpoints(_checkpoints)
+        print(f"[CHECKPOINT] #{h} assinado e salvo")
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f"[CHECKPOINT] falha ao assinar #{h}: {e}")
 
 
 # ============================================================
@@ -187,6 +257,8 @@ def _pow_search(prev_hash, merkle, ts, diff, nonce_start=0,
             nonce += 1
         hashes_done += HASH_BATCH_SIZE
 
+        time.sleep(0)
+
         if should_continue is not None and not should_continue():
             return None, None, hashes_done
         if progress_cb is not None:
@@ -268,13 +340,6 @@ class Blockchain:
             self.require_auth_tag = bool(self.network_secret)
         else:
             self.require_auth_tag = bool(require_auth_tag)
-
-        # [PATCH] Altura de ativação do auth_tag.
-        # 0 = desde o genesis. Para cadeias legadas use BRN_AUTH_TAG_HEIGHT.
-        self.auth_tag_activation_height = int(
-            os.environ.get("BRN_AUTH_TAG_HEIGHT",
-                           str(AUTH_TAG_ACTIVATION_HEIGHT))
-        )
 
         if not auto_genesis:
             self.genesis_expected_hash = GENESIS_BLOCK["hash"]
@@ -486,11 +551,25 @@ class Blockchain:
             u = self.db.get_utxo(inp["txid"], inp["vout"])
             if not u:
                 return False, "UTXO inexistente"
-            if inp["pubkey"] != u["pubkey"]:
-                return False, (
-                    f"pubkey mismatch: input={inp['pubkey'][:16]}... "
-                    f"utxo={u['pubkey'][:16] if u['pubkey'] else '(vazio)'}"
-                )
+
+            _stored_pk = (u["pubkey"] or "").strip()
+            if _stored_pk and set(_stored_pk) != {"0"}:
+                if inp["pubkey"] != _stored_pk:
+                    return False, (
+                        f"pubkey mismatch: input={inp['pubkey'][:16]}... "
+                        f"utxo={_stored_pk[:16]}"
+                    )
+            else:
+                try:
+                    from bech32 import address_from_pubkey
+                    derived = address_from_pubkey(bytes.fromhex(inp["pubkey"]))
+                except Exception:
+                    return False, "input pubkey invalida"
+                if derived != u["address"]:
+                    return False, (
+                        f"address mismatch: deriva {derived[:16]}... "
+                        f"utxo {u['address'][:16]}..."
+                    )
             in_sum += u["amount"]
 
         out_sum = sum(o["amount"] for o in tx["outputs"])
@@ -519,9 +598,10 @@ class Blockchain:
         return True, tx["txid"]
 
     # --------------------------------------------------------
-    # VALIDAÇÃO DE BLOCO (com auth_tag em ativação gradual)
+    # VALIDAÇÃO DE BLOCO (auth_tag + checkpoints)
     # --------------------------------------------------------
     def validate_block(self, block, prev_block=None):
+        # Genesis
         if block["height"] == 0 and prev_block is None:
             if self.genesis_expected_hash and block["hash"] != self.genesis_expected_hash:
                 return False, (
@@ -530,12 +610,14 @@ class Blockchain:
                     f"  recebido: {block['hash'][:16]}..."
                 )
 
+        # Encadeamento
         if block["prev_hash"] != (prev_block["hash"] if prev_block else self.db.tip_hash()):
             return False, "prev_hash incorreto"
         expected_height = (prev_block["height"] + 1) if prev_block else self.db.height() + 1
         if block["height"] != expected_height:
             return False, "altura invalida"
 
+        # PoW
         if not meets_difficulty(block["hash"], block["difficulty"]):
             return False, "PoW invalido"
         h = block_hash(block["prev_hash"], block["merkle"], block["timestamp"],
@@ -545,24 +627,31 @@ class Blockchain:
         if compute_merkle_root([t["txid"] for t in block["transactions"]]) != block["merkle"]:
             return False, "merkle incorreto"
 
-        # [PATCH] auth_tag: obrigatório só a partir da altura de ativação.
-        # Blocos com tag são SEMPRE verificados.
-        # Blocos sem tag só são aceitos se estiverem abaixo da ativação.
+        # v9.1.4: verifica checkpoint assinado (trava dura contra reorg)
+        ok_cp, msg_cp = _verify_checkpoint_for_block(block)
+        if not ok_cp:
+            return False, msg_cp
+
+        # v9.1.3: AUTH TAG com corte em AUTH_TAG_START_HEIGHT
         if self.require_auth_tag:
             if not self.network_secret:
                 return False, "no exige auth_tag mas nao tem BRN_NETWORK_SECRET"
-            tag = block.get("auth_tag")
-            if tag:
+
+            if block["height"] > AUTH_TAG_START_HEIGHT:
+                tag = block.get("auth_tag")
+                if not tag:
+                    return False, "bloco sem auth_tag"
                 if not verify_auth_tag(block["height"], block["hash"], tag,
                                        self.network_secret):
                     return False, "auth_tag invalido (segredo errado?)"
             else:
-                if block["height"] >= self.auth_tag_activation_height:
-                    return False, (
-                        f"bloco #{block['height']} sem auth_tag "
-                        f"(ativacao em #{self.auth_tag_activation_height})"
-                    )
+                tag = block.get("auth_tag")
+                if tag:
+                    if not verify_auth_tag(block["height"], block["hash"], tag,
+                                           self.network_secret):
+                        return False, "auth_tag invalido em bloco legado"
 
+        # Coinbase
         cb = block["transactions"][0]
         if cb["inputs"][0]["txid"] != "0" * 64:
             return False, "primeira tx nao e coinbase"
@@ -601,6 +690,9 @@ class Blockchain:
 
         self.db.add_block(block)
 
+        # v9.1.4: assina checkpoint se for altura multipla
+        _maybe_sign_checkpoint(block)
+
         for i, t in enumerate(block["transactions"]):
             coinbase = (i == 0)
             self.db.apply_tx(t, block["height"], coinbase=coinbase)
@@ -633,6 +725,21 @@ class Blockchain:
         blocks_to_add = [b for b in new_blocks if b["height"] > fork_height]
         if not blocks_to_add:
             return False, "nada novo"
+
+        # v9.1.4: nova cadeia nao pode violar nenhum checkpoint conhecido
+        for h_str, cp in _checkpoints.items():
+            try:
+                h_int = int(h_str)
+            except Exception:
+                continue
+            if h_int <= fork_height:
+                continue  # antes do fork, nao muda
+            nb = next((b for b in blocks_to_add if b["height"] == h_int), None)
+            if nb is None:
+                return False, f"nova cadeia nao contem checkpoint #{h_int}"
+            if nb["hash"] != cp.get("hash"):
+                return False, f"checkpoint #{h_int} violado pela nova cadeia"
+
         work_alt = self.cumulative_work_of_chain(blocks_to_add)
         work_local = 0
         for h in range(fork_height + 1, self.db.height() + 1):
