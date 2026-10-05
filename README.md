@@ -1,3 +1,261 @@
+Guia passo a passo — instalar um nó BRN em uma máquina nova
+Pré-requisitos (rodar uma vez por máquina)
+Ubuntu 24.04
+bash
+sudo apt update
+sudo apt install -y python3 python3-pip python3-venv git
+Windows 10/11
+Instale o Python 3.11+: https://python.org → marque "Add Python to PATH"
+
+Instale o Git: https://git-scm.com/download/win
+
+Abra o PowerShell e confirme:
+
+powershell
+python --version    # deve mostrar Python 3.11.x ou superior
+git --version       # deve mostrar git version 2.x
+Etapa 1 — Copiar o segredo da rede da Máquina A
+Esta é a etapa mais importante. Sem o BRN_NETWORK_SECRET correto, o nó novo é rejeitado por todos os peers.
+
+Na Máquina A (origem, já rodando)
+bash
+cd ~/Músicas/com-brn/BRN-COM-PEERS-FUNCIONANDO-main
+
+# Veja o conteúdo do segredo
+cat brn_network.env
+Saída esperada:
+
+text
+BRN_NETWORK_SECRET=a1b2c3d4e5f6...64 chars hex...
+BRN_TRACKER=https://brn-tracker.onrender.com
+BRN_BOOTSTRAP_PEERS=177.82.132.98:6001
+Copie o valor do BRN_NETWORK_SECRET (a linha inteira após =).
+
+Como transferir para a máquina nova
+Escolha um método:
+
+Opção A — Pendrive (mais simples)
+
+bash
+# Na Máquina A
+cp brn_network.env /media/pendrive/
+# Plug no micro novo, copie para a pasta do projeto
+Opção B — SCP (mesma LAN)
+
+bash
+# No micro novo, com a Máquina A acessível
+scp bruno@IP_DA_MAQUINA_A:~/Músicas/com-brn/BRN-COM-PEERS-FUNCIONANDO-main/brn_network.env .
+Opção C — Copiar manualmente
+
+Anote o valor do BRN_NETWORK_SECRET num papel/gerenciador de senhas. Vai colar depois.
+
+Etapa 2 — Clonar o projeto do GitHub
+Ubuntu
+bash
+cd ~/
+git clone https://github.com/brunoldo2312/BRN-COM-PEERS-FUNCIONANDO.git BRN-COM-PEERS-FUNCIONANDO-main
+cd BRN-COM-PEERS-FUNCIONANDO-main
+Windows (PowerShell)
+powershell
+cd $HOME
+git clone https://github.com/brunoldo2312/BRN-COM-PEERS-FUNCIONANDO.git BRN-COM-PEERS-FUNCIONANDO-main
+cd BRN-COM-PEERS-FUNCIONANDO-main
+Saída esperada:
+
+text
+Cloning into 'BRN-COM-PEERS-FUNCIONANDO-main'...
+remote: Enumerating objects: ...
+Receiving objects: 100% ...
+Se o clone falhar pedindo senha → use token do GitHub (não sua senha):
+
+Crie em: https://github.com/settings/tokens
+
+Marque o escopo repo
+
+Use como senha quando o git pedir
+
+Etapa 3 — Criar o brn_network.env
+Se você copiou o arquivo (Opção A/B)
+bash
+# Já está na pasta? Confirme:
+ls -la brn_network.env
+
+# Permissão segura
+chmod 600 brn_network.env     # Linux
+Se você anotou o segredo (Opção C)
+bash
+# Linux/macOS
+nano brn_network.env
+Cole (troque COLE_O_SEGREDO_AQUI pelo valor da Máquina A):
+
+text
+BRN_NETWORK_SECRET=COLE_O_SEGREDO_AQUI
+BRN_TRACKER=https://brn-tracker.onrender.com
+BRN_BOOTSTRAP_PEERS=177.82.132.98:6001
+Salvar: Ctrl+O → Enter → Ctrl+X.
+
+bash
+chmod 600 brn_network.env
+Windows (PowerShell)
+powershell
+@"
+BRN_NETWORK_SECRET=COLE_O_SEGREDO_AQUI
+BRN_TRACKER=https://brn-tracker.onrender.com
+BRN_BOOTSTRAP_PEERS=177.82.132.98:6001
+"@ | Out-File -Encoding ASCII brn_network.env
+Ou simplesmente crie no Bloco de Notas com as 3 linhas.
+
+Confirmação crítica
+bash
+# O fingerprint do seu segredo — DEVE ser igual ao da Máquina A
+python3 -c "import hashlib; print(hashlib.sha256(open('brn_network.env').read().splitlines()[0].split('=',1)[1].encode()).hexdigest()[:16])"
+Saída esperada (exemplo):
+
+text
+7ffd8777afb71adb
+Compare com a Máquina A. Se os dois fingerprints forem idênticos → segredo correto. Se diferentes → você copiou errado.
+
+Etapa 4 — Rodar o instalador
+Ubuntu
+bash
+chmod +x iniciar.sh
+./iniciar.sh
+Windows
+cmd
+iniciar.bat
+O script vai:
+
+Detectar Python
+
+Criar .venv/ (virtualenv)
+
+Instalar dependências (~30 s na 1ª vez)
+
+Carregar brn_network.env
+
+Detectar que é cliente (não tem DB local)
+
+Baixar a blockchain dos peers
+
+Abrir a carteira quando terminar
+
+Saída esperada (Ubuntu)
+text
+[ok] Python sistema: 3.12.x
+[ok] Venv ativo
+[*] Verificando/instalando dependencias...
+[ok] Dependencias instaladas
+============================================================
+  BRN Node — CLIENTE (MAQUINA B / SINCRONIZA)
+============================================================
+  Maquina    : micro-novo
+  Papel      : cliente
+  Auth FP    : 7ffd8777afb71adb...
+  ...
+============================================================
+[*] Iniciando no BRN...
+[INFO] P2P porta 6001 | No ID: ...
+[INFO] Cliente: DB vazio. Aguardando genesis da rede...
+[INFO] Genesis recebido! Altura: 0
+[INFO] Sincronizando bloco #500...
+[INFO] Sincronizando bloco #1000...
+[INFO] Sincronizando bloco #1500...
+[INFO] Altura atual: 3694
+[INFO] Miner reinicializado apos sync do genesis
+Tempo esperado: 2-5 minutos para sincronizar 3.700 blocos.
+
+Etapa 5 — Verificar que está funcionando
+Abra outro terminal e rode:
+
+1. Altura da cadeia
+bash
+curl -s http://127.0.0.1:5000/api/chain-info | python3 -m json.tool
+Esperado:
+
+json
+{
+    "success": true,
+    "height": 3694,
+    "tip_hash": "000005356bf8b579...",
+    "difficulty": 7
+}
+O height deve bater com o da Máquina A. Se estiver subindo de pouco em pouco, ainda está sincronizando.
+
+2. Peers conectados
+bash
+curl -s http://127.0.0.1:5000/api/status | python3 -m json.tool | grep peers
+Esperado: "peers": 1 ou mais.
+
+3. Progresso da sync
+bash
+curl -s http://127.0.0.1:5000/api/sync-info | python3 -m json.tool
+Esperado:
+
+json
+{
+    "sync": {
+        "percent": 100.0,
+        "height": 3694,
+        "target": 3694,
+        "peers": 1
+    }
+}
+4. Abrir a carteira
+Ubuntu: a janela do pywebview abre automaticamente. Se não, acesse http://127.0.0.1:5000 no navegador.
+
+Windows: mesma coisa.
+
+Na carteira:
+
+Aba 💼 Carteira → 🎲 Gerar nova
+
+Guarde a chave privada
+
+Aba 📤 Enviar → ⛏️ Iniciar mineração (opcional — só se quiser minerar)
+
+Etapa 6 — Ativar mineração (opcional)
+Se quiser que este nó também minere:
+
+Aba 📤 Enviar na carteira
+
+Clique em ⛏️ Iniciar mineração
+
+O log do terminal mostra:
+
+text
+[Miner] Miner iniciado | addr=brn1xxx...
+[Miner] OK Bloco #3695 minerado (total=1)
+Cada nó com o segredo correto pode minerar. Não é preciso permissão especial.
+
+Resumo visual
+text
+┌─────────────────────────────────────────────────────────────┐
+│  MÁQUINA A (origem, já rodando)                             │
+│  - tem brn_network.env                                      │
+│  - tem a blockchain (3694 blocos)                           │
+│  - assina blocos com HMAC                                   │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+                           │ Copiar brn_network.env
+                           │ (pendrive/scp/email)
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  MÁQUINA NOVA                                               │
+│  1. git clone (código do GitHub)                            │
+│  2. Cola brn_network.env (segredo)                          │
+│  3. ./iniciar.sh                                            │
+│  4. P2P conecta na Máquina A                                │
+│  5. Baixa blocos 0..3694 (2-5 min)                          │
+│  6. ✅ Nó sincronizado — pode minerar                       │
+└─────────────────────────────────────────────────────────────┘
+Checklist
+Antes de rodar ./iniciar.sh, verifique:
+
+□ Python 3.11+ instalado (python3 --version)
+□ Git instalado (git --version)
+□ git clone completou sem erro
+□ brn_network.env existe na pasta
+□ O BRN_NETWORK_SECRET é idêntico ao da Máquina A
 a) Infisical - Recomendo esse hoje
 •  Open source, self-hosted, plano cloud gratuito.
 •  Você guarda a chave lá e seu app busca via API com um token.
