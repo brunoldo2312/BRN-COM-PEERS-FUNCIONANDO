@@ -8,12 +8,20 @@ Uso:
     result = verify_chain(blockchain)          # ChainVerificationResult
     result = verify_chain_dict(blockchain)     # dict serializavel
 
-v6: adiciona verificacao de assinatura Ed25519 em cada tx nao-coinbase,
+v9.1.1:
+  - [SEGURANÇA] Verifica auth_tag (HMAC-SHA256) em cada bloco
+    quando require_auth_tag=True. Corrige lacuna onde verify_chain
+    aceitava cadeia com auth_tag apagado/adulterado.
+  - [FIX] _pubkey_matches_from usa bech32.address_from_pubkey
+    (mesma funcao usada pelo blockchain.validate_tx).
+  - [FIX] Fallback para UTXO sem pubkey (valida por endereco).
+
+v6:
+  - Verificacao de assinatura Ed25519 em cada tx nao-coinbase,
     binding pubkey<->from, e rejeicao de coinbase com assinatura.
 ============================================================
 """
 import time
-from typing import Any
 
 
 # ============================================================
@@ -26,6 +34,7 @@ class ChainVerificationResult:
         self.warnings: list[str] = []
         self.blocks_checked = 0
         self.txs_checked = 0
+        self.auth_tags_checked = 0
         self.height = 0
         self.tip_hash = ""
         self.elapsed_s = 0.0
@@ -44,6 +53,7 @@ class ChainVerificationResult:
             "warnings": self.warnings,
             "blocks_checked": self.blocks_checked,
             "txs_checked": self.txs_checked,
+            "auth_tags_checked": self.auth_tags_checked,
             "height": self.height,
             "tip_hash": self.tip_hash,
             "elapsed_s": self.elapsed_s,
@@ -62,7 +72,7 @@ class ChainVerificationResult:
 
 
 # ============================================================
-# v6: HELPERS DE VALIDACAO CRIPTOGRAFICA
+# HELPERS DE VALIDACAO CRIPTOGRAFICA
 # ============================================================
 def _verify_tx_signature(tx: dict) -> tuple[bool, str]:
     """
@@ -97,21 +107,58 @@ def _pubkey_matches_from(tx: dict) -> tuple[bool, str]:
     """
     Bind pubkey -> endereco -> input. Evita ataque onde o atacante
     troca 'from'/'pubkey' mantendo a assinatura original.
+
+    v9.1.1: usa bech32.address_from_pubkey (mesma funcao do blockchain).
     """
-    from crypto import pubkey_to_address
+    # Importa do mesmo lugar que o blockchain.validate_tx usa
+    try:
+        from bech32 import address_from_pubkey
+    except ImportError:
+        # Fallback para crypto.pubkey_to_address (versao antiga)
+        try:
+            from crypto import pubkey_to_address as address_from_pubkey
+        except ImportError:
+            return False, "modulo bech32/crypto nao encontrado"
 
     for i, inp in enumerate(tx["inputs"]):
         pk_hex = inp.get("pubkey", "")
         if not pk_hex:
             return False, f"input[{i}] sem pubkey"
-        # Se a UTXO que este input gasta tinha endereco, checamos que
-        # a pubkey fornecida gera aquele endereco. Essa checagem final
-        # ja e feita em blockchain.validate_tx via db.get_utxo.
-        # Aqui so garantimos que a pubkey e parseavel e gera um endereco.
         try:
-            _ = pubkey_to_address(pk_hex)
+            _ = address_from_pubkey(bytes.fromhex(pk_hex))
         except Exception as e:
             return False, f"input[{i}] pubkey invalida ({e})"
+
+    return True, ""
+
+
+# ============================================================
+# v9.1.1: VERIFICACAO DO AUTH TAG (HMAC)
+# ============================================================
+def _verify_block_auth_tag(block: dict, blockchain) -> tuple[bool, str]:
+    """
+    Verifica auth_tag do bloco se a blockchain exigir.
+    Retorna (ok, motivo). Motivo vazio se ok.
+    """
+    # Se a blockchain nao exige, retorna OK
+    if not getattr(blockchain, "require_auth_tag", False):
+        return True, ""
+
+    secret = getattr(blockchain, "network_secret", "") or ""
+    if not secret:
+        return False, "no exige auth_tag mas nao tem network_secret"
+
+    tag = block.get("auth_tag")
+    if not tag:
+        return False, "bloco sem auth_tag"
+
+    try:
+        from blockchain import verify_auth_tag
+    except ImportError:
+        return False, "funcao verify_auth_tag nao encontrada"
+
+    if not verify_auth_tag(block["height"], block["hash"], tag, secret):
+        return False, "auth_tag invalido (segredo errado ou hash adulterado)"
 
     return True, ""
 
@@ -139,6 +186,7 @@ def verify_chain(blockchain) -> ChainVerificationResult:
       13. [v6] Assinatura Ed25519 valida em txs nao-coinbase
       14. [v6] Pubkey corresponde ao 'from'
       15. [v6] Coinbase NAO tem assinatura nem pubkey no input
+      16. [v9.1.1] auth_tag (HMAC) valido quando require_auth_tag=True
     """
     from blockchain import (
         block_hash, meets_difficulty, compute_merkle_root,
@@ -157,9 +205,11 @@ def verify_chain(blockchain) -> ChainVerificationResult:
         result.add_error("Cadeia vazia (nenhum bloco).")
         return result
 
+    require_auth = bool(getattr(blockchain, "require_auth_tag", False))
+
     spent_utxos: set[tuple[str, int]] = set()
     all_txids: set[str] = set()
-    prev_hash: str | None = None
+    prev_hash = None
 
     for h in range(height + 1):
         block = db.get_block(h)
@@ -213,6 +263,14 @@ def verify_chain(blockchain) -> ChainVerificationResult:
                 f"({block['merkle'][:12]}... vs {merkle_calc[:12]}...)"
             )
 
+        # 16) auth_tag (v9.1.1) — depois de validar hash + PoW
+        if require_auth:
+            ok_tag, motivo_tag = _verify_block_auth_tag(block, blockchain)
+            if not ok_tag:
+                result.add_error(f"{prefixo}: {motivo_tag}")
+            else:
+                result.auth_tags_checked += 1
+
         # 7) coinbase
         if not block["transactions"]:
             result.add_error(f"{prefixo}: bloco sem transacoes")
@@ -239,7 +297,6 @@ def verify_chain(blockchain) -> ChainVerificationResult:
                     f"{prefixo}: coinbase {cb_total} > "
                     f"recompensa {reward_esp} + taxas {fees}"
                 )
-            # v6: coinbase nao deve ter assinatura
             for inp in cb["inputs"]:
                 if inp.get("signature") or inp.get("pubkey"):
                     result.add_error(
@@ -251,42 +308,34 @@ def verify_chain(blockchain) -> ChainVerificationResult:
             result.txs_checked += 1
             short = t.get("txid", "?")[:12]
 
-            # 9) txid canonico
             try:
                 if t["txid"] != calc_txid(t):
                     result.add_error(f"{prefixo}: tx {short}... txid adulterado")
             except Exception as e:
                 result.add_error(f"{prefixo}: erro ao recalcular txid ({e})")
 
-            # 10) txid duplicada
             if t["txid"] in all_txids:
                 result.add_error(f"{prefixo}: txid duplicada {short}...")
             all_txids.add(t["txid"])
 
-            # Coinbase — pula as checagens de assinatura
             if idx == 0 and is_cb:
                 continue
 
-            # 13) campos obrigatorios
             if not _has_required_fields(t):
                 result.add_error(f"{prefixo}: tx {short}... faltando campos")
                 continue
 
-            # 14) assinatura
             ok_sig, motivo = _verify_tx_signature(t)
             if not ok_sig:
                 result.add_error(f"{prefixo}: tx {short}... {motivo}")
-                # ainda registra UTXOs para nao mascarar gasto duplo
                 for inp in t["inputs"]:
                     spent_utxos.add((inp["txid"], inp["vout"]))
                 continue
 
-            # 15) binding pubkey <-> from
             ok_bind, motivo_bind = _pubkey_matches_from(t)
             if not ok_bind:
                 result.add_error(f"{prefixo}: tx {short}... {motivo_bind}")
 
-            # 9) gasto duplo
             for inp in t["inputs"]:
                 key = (inp["txid"], inp["vout"])
                 if key in spent_utxos:
