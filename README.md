@@ -1,3 +1,17 @@
+# 1. Salvar os 3 arquivos nas duas máquinas:
+#    - brn_tailscale_setup.py
+#    - iniciar.bat (Windows)
+#    - brn.sh (Ubuntu — patch)
+
+# 2. Criar arquivo brn_tailscale_peer.txt nas duas (temporariamente vazio)
+
+# 3. Rodar manualmente na primeira vez:
+#    Ubuntu:   python3 brn_tailscale_setup.py
+#    Windows:  python brn_tailscale_setup.py
+
+# 4. A partir de agora, só rodar:
+#    Ubuntu:   ./brn.sh
+#    Windows:  iniciar.bat
 Guia passo a passo — instalar um nó BRN em uma máquina nova
 Pré-requisitos (rodar uma vez por máquina)
 Ubuntu 24.04
