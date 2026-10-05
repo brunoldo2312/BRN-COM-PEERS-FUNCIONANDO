@@ -1,32 +1,37 @@
-﻿"""
+"""
 blockchain.py — Núcleo da Blockchain BRN
-Versão: 7.1.2 | Data: 01/10/2026
+Versão: 9.1.1 | Data: 05/10/2026
 
-Changelog v7.1.2:
-- [PERF] mine_block_interruptible: time.sleep(0) a cada 10k iterações
-  libera o GIL para o Flask responder. Sem isto, o /api/status bloqueia
-  durante a mineração e a carteira recebe TIMEOUT.
-
-Changelog v7.1.1 (SEGURANÇA):
+Changelog v9.1.1:
+- [PERF] _pow_search: time.sleep(0) a cada HASH_BATCH_SIZE iteracoes.
+  Libera o GIL para o Flask responder /api/status durante mineracao.
+  Corrige TIMEOUT na carteira enquanto o miner esta rodando.
 - [FIX SEGURO] validate_tx: UTXOs com pubkey vazia/zeros (coinbases
-  antigas) são validadas pelo ENDEREÇO. Deriva hash160(pubkey_do_input)
-  e compara com u["address"]. Impossível forjar sem quebrar SHA256.
+  antigas) sao validadas pelo ENDEREÇO derivado do input. Impossivel
+  forjar sem quebrar SHA256.
 
-Changelog v7.0:
-- [CRÍTICO] auto_genesis: cliente (B) NÃO cria gênesis — espera da rede.
-- [CRÍTICO] validate_block valida gênesis do cliente contra hash esperado.
-- [CRÍTICO] Removido fallback "00"*33 em make_coinbase/mine_block.
-- [CRÍTICO] data entra no _tx_core (necessário para contrato de genes).
+v9.1:
+- [SEGURANÇA] Blocos carregam auth_tag = HMAC-SHA256(segredo, height:hash).
+- Todos os nós rodam o MESMO codigo. Nao ha "autoridade" — apenas
+  quem possui o segredo da rede consegue produzir blocos validos.
+- Configurado via env var BRN_NETWORK_SECRET.
+- require_auth_tag default = True se segredo estiver configurado.
 
-v6.0 (breaking):
-- make_coinbase/build_genesis exigem pubkey na saída.
-- validate_tx exige correspondência EXATA entre input.pubkey e utxo.pubkey.
-- txid() e signing_hash() derivam do MESMO _tx_core().
-- signing_hash prefixa b"BRN-TX-v1|" (domain separation).
-- versão explícita (_CORE_V) na serialização.
+v8.2:
+- mine_block e mine_block_interruptible usam hot loop baseado em bytes.
+- MAX_DIFFICULTY = 7.
+
+v8.1:
+- current_difficulty() respeita MAX_DIFFICULTY.
+
+v8.0:
+- Suporte a contratos inteligentes.
 """
 
+import os
 import time
+import hmac
+import hashlib
 import orjson
 from crypto import double_sha256, sha256
 from db import ChainDB
@@ -41,22 +46,49 @@ HALVING_INTERVAL = 210_000
 BLOCK_TIME = 120
 DIFFICULTY_INTERVAL = 2016
 INITIAL_DIFFICULTY = 3
-MAX_DIFFICULTY = 5
+MAX_DIFFICULTY = 7
 MAX_TX_PER_BLOCK = 500
 MIN_RELAY_FEE = 1000
 MAX_REORG_DEPTH = 100
+
+HASH_BATCH_SIZE = 5000
 
 GENESIS_PREV = "0" * 64
 GENESIS_TIMESTAMP = 1700000000
 GENESIS_REWARD = INITIAL_REWARD
 GENESIS_ADDRESS = "brn1qxyzk7y0v2j4g0a8d9n5t2k7h4s6w8c9p2e"
-
 GENESIS_PUBKEY = ""
 
 SIGNING_DOMAIN = b"BRN-TX-v1|"
+AUTH_TAG_DOMAIN = b"BRN-BLOCK-AUTH-v1|"
 _CORE_V = 1
 
+NETWORK_SECRET = os.environ.get("BRN_NETWORK_SECRET", "").strip()
 
+
+# ============================================================
+# AUTH TAG (HMAC do bloco)
+# ============================================================
+def compute_auth_tag(height: int, block_hash_hex: str,
+                     secret: str = None) -> str:
+    sec = secret if secret is not None else NETWORK_SECRET
+    if not sec:
+        return ""
+    msg = AUTH_TAG_DOMAIN + f"{int(height)}:{block_hash_hex}".encode()
+    return hmac.new(sec.encode(), msg, hashlib.sha256).hexdigest()
+
+
+def verify_auth_tag(height: int, block_hash_hex: str, tag: str,
+                    secret: str = None) -> bool:
+    expected = compute_auth_tag(height, block_hash_hex, secret)
+    if not expected or not tag:
+        return False
+    return hmac.compare_digest(expected, tag)
+
+
+# ============================================================
+# PoW / DIFICULDADE
+# ============================================================
 def block_hash(prev_hash, merkle, timestamp, nonce, difficulty):
     header = f"{prev_hash}{merkle}{timestamp}{nonce}{difficulty}"
     return double_sha256(header.encode()).hex()
@@ -85,21 +117,17 @@ def compute_merkle_root(txids):
     return layer[0].hex()
 
 
+# ============================================================
+# SERIALIZAÇÃO CANÔNICA
+# ============================================================
 def _tx_core(tx):
     inputs = [
-        {
-            "txid": i["txid"],
-            "vout": i["vout"],
-            "pubkey": i.get("pubkey", ""),
-        }
+        {"txid": i["txid"], "vout": i["vout"], "pubkey": i.get("pubkey", "")}
         for i in tx["inputs"]
     ]
     outputs = [
-        {
-            "address": o["address"],
-            "amount": o["amount"],
-            "pubkey": o.get("pubkey", ""),
-        }
+        {"address": o["address"], "amount": o["amount"],
+         "pubkey": o.get("pubkey", "")}
         for o in tx["outputs"]
     ]
     core = {
@@ -129,11 +157,49 @@ def signing_hash(tx):
     return double_sha256(SIGNING_DOMAIN + _serialize_core(tx))
 
 
+# ============================================================
+# HOT LOOP DE PoW
+# ============================================================
+def _pow_search(prev_hash, merkle, ts, diff, nonce_start=0,
+                should_continue=None, progress_cb=None):
+    """
+    v9.1.1: time.sleep(0) a cada HASH_BATCH_SIZE iteracoes libera o GIL
+    para o Flask responder /api/status durante a mineracao.
+    """
+    prefix = f"{prev_hash}{merkle}{ts}".encode()
+    diff_bytes = str(diff).encode()
+    target_int = int("0" * diff + "f" * (64 - diff), 16)
+    sha = hashlib.sha256
+
+    nonce = nonce_start
+    hashes_done = 0
+    while True:
+        for _ in range(HASH_BATCH_SIZE):
+            data = prefix + str(nonce).encode() + diff_bytes
+            h = sha(sha(data).digest()).digest()
+            if int.from_bytes(h, "big") <= target_int:
+                return nonce, h.hex(), hashes_done + 1
+            nonce += 1
+        hashes_done += HASH_BATCH_SIZE
+
+        # v9.1.1: libera o GIL
+        time.sleep(0)
+
+        if should_continue is not None and not should_continue():
+            return None, None, hashes_done
+        if progress_cb is not None:
+            try:
+                progress_cb(nonce, hashes_done)
+            except Exception:
+                pass
+
+
+# ============================================================
+# COINBASE E GÊNESE
+# ============================================================
 def make_coinbase(address, pubkey_hex, height, reward):
     if not pubkey_hex:
-        raise ValueError(
-            "make_coinbase: pubkey_hex é obrigatória (sem fallback '00'*33)"
-        )
+        raise ValueError("make_coinbase: pubkey_hex é obrigatória")
     cb = {
         "txid": "",
         "inputs": [{"txid": "0" * 64, "vout": 0xFFFFFFFF,
@@ -169,20 +235,37 @@ def build_genesis():
         if h.startswith("0"):
             break
         nonce += 1
-    return {"height": 0, "hash": h, "prev_hash": GENESIS_PREV,
-            "timestamp": GENESIS_TIMESTAMP, "nonce": nonce,
-            "merkle": merkle, "difficulty": 1, "transactions": [cb]}
+    g = {"height": 0, "hash": h, "prev_hash": GENESIS_PREV,
+         "timestamp": GENESIS_TIMESTAMP, "nonce": nonce,
+         "merkle": merkle, "difficulty": 1, "transactions": [cb]}
+    tag = compute_auth_tag(0, h)
+    if tag:
+        g["auth_tag"] = tag
+    return g
 
 
 GENESIS_BLOCK = build_genesis()
 
 
+# ============================================================
+# BLOCKCHAIN
+# ============================================================
 class Blockchain:
     def __init__(self, db_path="brn_v2_chain.db",
                  genesis_address=None, genesis_pubkey=None,
-                 auto_genesis=True):
+                 auto_genesis=True,
+                 network_secret=None,
+                 require_auth_tag=None):
         self.db = ChainDB(db_path)
         self.genesis_expected_hash = None
+
+        self.network_secret = (network_secret
+                               if network_secret is not None
+                               else NETWORK_SECRET)
+        if require_auth_tag is None:
+            self.require_auth_tag = bool(self.network_secret)
+        else:
+            self.require_auth_tag = bool(require_auth_tag)
 
         if not auto_genesis:
             self.genesis_expected_hash = GENESIS_BLOCK["hash"]
@@ -220,10 +303,22 @@ class Blockchain:
             if h.startswith("0"):
                 break
             nonce += 1
-        return {"height": 0, "hash": h, "prev_hash": GENESIS_PREV,
-                "timestamp": GENESIS_TIMESTAMP, "nonce": nonce,
-                "merkle": merkle, "difficulty": 1, "transactions": [cb]}
+        g = {"height": 0, "hash": h, "prev_hash": GENESIS_PREV,
+             "timestamp": GENESIS_TIMESTAMP, "nonce": nonce,
+             "merkle": merkle, "difficulty": 1, "transactions": [cb]}
+        tag = compute_auth_tag(0, h)
+        if tag:
+            g["auth_tag"] = tag
+        return g
 
+    def set_network_secret(self, secret: str):
+        self.network_secret = (secret or "").strip()
+        if self.require_auth_tag is False:
+            self.require_auth_tag = bool(self.network_secret)
+
+    # --------------------------------------------------------
+    # RECOMPENSA / DIFICULDADE / TRABALHO
+    # --------------------------------------------------------
     def current_reward(self, height):
         halvings = height // HALVING_INTERVAL
         if halvings >= 64:
@@ -238,6 +333,8 @@ class Blockchain:
         end = self.db.get_block(h)
         if not start or not end:
             return INITIAL_DIFFICULTY
+        if end["difficulty"] > MAX_DIFFICULTY:
+            return MAX_DIFFICULTY
         actual = max(1, end["timestamp"] - start["timestamp"])
         expected = BLOCK_TIME * DIFFICULTY_INTERVAL
         prev = end["difficulty"]
@@ -257,6 +354,9 @@ class Blockchain:
     def cumulative_work_of_chain(self, blocks):
         return sum(work_from_difficulty(b["difficulty"]) for b in blocks)
 
+    # --------------------------------------------------------
+    # FEE
+    # --------------------------------------------------------
     def estimate_fee(self, priority="medium"):
         stats = self.db.mempool_stats()
         count = stats["count"]
@@ -283,16 +383,75 @@ class Blockchain:
                 in_sum += u["amount"]
         return in_sum - sum(o["amount"] for o in tx["outputs"])
 
+    # --------------------------------------------------------
+    # CONTRATOS
+    # --------------------------------------------------------
+    def _validate_contract_tx(self, tx):
+        tx_data = tx.get("data") or {}
+        t = tx_data.get("type")
+        if t == "deploy":
+            code = tx_data.get("code")
+            if not isinstance(code, dict):
+                return False, "deploy sem 'code' (dict)"
+            try:
+                from contracts import ContractVM
+                return ContractVM.validate(code)
+            except ImportError:
+                return False, "modulo contracts.py nao encontrado"
+            except Exception as e:
+                return False, f"erro validando contrato: {e}"
+        if t == "call":
+            cid = tx_data.get("contract_id")
+            if not cid or not isinstance(cid, str):
+                return False, "call sem 'contract_id'"
+            if not cid.startswith("ctr1"):
+                return False, "contract_id deve começar com 'ctr1'"
+            if not self.db.contract_get(cid):
+                return False, f"contrato {cid[:16]}... nao existe"
+            return True, "ok"
+        return False, f"tipo de contrato desconhecido: {t}"
+
+    def _apply_contract_tx(self, tx):
+        tx_data = tx.get("data") or {}
+        t = tx_data.get("type")
+        from contracts import deploy as _deploy, call as _call
+        if t == "deploy":
+            owner = ""
+            if tx.get("outputs"):
+                owner = tx["outputs"][0].get("address", "") or ""
+            r = _deploy(self, owner, tx_data.get("code") or {},
+                        metadata=tx_data.get("metadata"))
+            if not r.get("ok"):
+                raise ValueError(f"deploy falhou: {r.get('msg')}")
+            return r
+        if t == "call":
+            caller = ""
+            if tx.get("outputs"):
+                caller = tx["outputs"][0].get("address", "") or ""
+            r = _call(self, tx_data.get("contract_id", ""),
+                      caller, tx_data.get("args"))
+            if not r.get("ok"):
+                raise ValueError(f"call falhou: {r.get('msg')}")
+            return r
+        raise ValueError(f"tipo de contrato desconhecido: {t}")
+
+    # --------------------------------------------------------
+    # VALIDAÇÃO DE TRANSAÇÃO
+    # --------------------------------------------------------
     def validate_tx(self, tx, from_mempool=False):
         from wallet import Wallet
-
         if not tx.get("inputs") or not tx.get("outputs"):
             return False, "tx sem inputs/outputs"
         if tx["inputs"][0]["txid"] == "0" * 64:
             return False, "coinbase invalida"
-
         if tx.get("txid") != txid(tx):
             return False, "txid invalido"
+
+        tx_data = tx.get("data") or {}
+        if isinstance(tx_data, dict) and tx_data.get("type") in ("deploy", "call"):
+            ok_ctr, msg_ctr = self._validate_contract_tx(tx)
+            if not ok_ctr:
+                return False, f"contrato: {msg_ctr}"
 
         for inp in tx["inputs"]:
             if not inp.get("pubkey"):
@@ -315,15 +474,14 @@ class Blockchain:
             if key in seen:
                 return False, "input duplicado"
             seen.add(key)
-
             u = self.db.get_utxo(inp["txid"], inp["vout"])
             if not u:
                 return False, "UTXO inexistente"
 
             # ============================================================
-            # FIX SEGURO v7.1.1:
-            # - UTXO com pubkey real (v6.0+)  → match EXATO
-            # - UTXO sem pubkey (coinbase antiga) → valida pelo ENDEREÇO
+            # v9.1.1 FIX SEGURO:
+            # - UTXO com pubkey real (v6.0+)  -> match EXATO
+            # - UTXO sem pubkey (coinbase antiga) -> valida pelo ENDEREÇO
             # ============================================================
             _stored_pk = (u["pubkey"] or "").strip()
             if _stored_pk and set(_stored_pk) != {"0"}:
@@ -355,7 +513,6 @@ class Blockchain:
         for inp in tx["inputs"]:
             if not Wallet.verify(sig_hash, inp.get("signature", ""), inp["pubkey"]):
                 return False, "assinatura invalida"
-
         return True, "ok"
 
     def submit_tx(self, tx):
@@ -371,6 +528,9 @@ class Blockchain:
             return False, "falha na mempool"
         return True, tx["txid"]
 
+    # --------------------------------------------------------
+    # VALIDAÇÃO DE BLOCO (com auth_tag)
+    # --------------------------------------------------------
     def validate_block(self, block, prev_block=None):
         if block["height"] == 0 and prev_block is None:
             if self.genesis_expected_hash and block["hash"] != self.genesis_expected_hash:
@@ -385,6 +545,7 @@ class Blockchain:
         expected_height = (prev_block["height"] + 1) if prev_block else self.db.height() + 1
         if block["height"] != expected_height:
             return False, "altura invalida"
+
         if not meets_difficulty(block["hash"], block["difficulty"]):
             return False, "PoW invalido"
         h = block_hash(block["prev_hash"], block["merkle"], block["timestamp"],
@@ -393,6 +554,16 @@ class Blockchain:
             return False, "hash incorreto"
         if compute_merkle_root([t["txid"] for t in block["transactions"]]) != block["merkle"]:
             return False, "merkle incorreto"
+
+        if self.require_auth_tag:
+            if not self.network_secret:
+                return False, "no exige auth_tag mas nao tem BRN_NETWORK_SECRET"
+            tag = block.get("auth_tag")
+            if not tag:
+                return False, "bloco sem auth_tag"
+            if not verify_auth_tag(block["height"], block["hash"], tag,
+                                   self.network_secret):
+                return False, "auth_tag invalido (segredo errado?)"
 
         cb = block["transactions"][0]
         if cb["inputs"][0]["txid"] != "0" * 64:
@@ -421,18 +592,34 @@ class Blockchain:
             return False, "coinbase acima do permitido"
         return True, "ok"
 
+    # --------------------------------------------------------
+    # ACEITAÇÃO DE BLOCO
+    # --------------------------------------------------------
     def accept_block(self, block):
         prev = self.db.get_block_by_hash(block["prev_hash"])
         ok, msg = self.validate_block(block, prev)
         if not ok:
             return False, msg
+
         self.db.add_block(block)
+
         for i, t in enumerate(block["transactions"]):
-            self.db.apply_tx(t, block["height"], coinbase=(i == 0))
+            coinbase = (i == 0)
+            self.db.apply_tx(t, block["height"], coinbase=coinbase)
             if i > 0:
                 self.db.remove_mempool(t["txid"])
+            if not coinbase:
+                tx_data = t.get("data") or {}
+                if isinstance(tx_data, dict) and tx_data.get("type") in ("deploy", "call"):
+                    try:
+                        self._apply_contract_tx(t)
+                    except Exception as e:
+                        print(f"[CONTRACT] tx {t['txid'][:16]}... falhou: {e}")
         return True, block["hash"]
 
+    # --------------------------------------------------------
+    # REORG
+    # --------------------------------------------------------
     def reorg_to(self, new_blocks):
         if not new_blocks:
             return False, "lista vazia"
@@ -489,11 +676,19 @@ class Blockchain:
         print(f"[REORG] concluido! Altura: {self.db.height()}")
         return True, f"reorg ok ({len(blocks_to_add)} blocos)"
 
+    # --------------------------------------------------------
+    # MINERAÇÃO
+    # --------------------------------------------------------
+    def _attach_auth_tag(self, block):
+        tag = compute_auth_tag(block["height"], block["hash"],
+                               self.network_secret)
+        if tag:
+            block["auth_tag"] = tag
+        return block
+
     def mine_block(self, miner_address, miner_pubkey):
         if not miner_pubkey:
-            raise ValueError(
-                "mine_block: miner_pubkey é obrigatória (sem fallback '00'*33)"
-            )
+            raise ValueError("mine_block: miner_pubkey é obrigatória")
         height = self.db.height() + 1
         reward = self.current_reward(height)
         diff = self.current_difficulty()
@@ -503,25 +698,19 @@ class Blockchain:
         merkle = compute_merkle_root([t["txid"] for t in txs])
         prev_hash = self.db.tip_hash()
         ts = int(time.time())
-        nonce = 0
-        while True:
-            h = block_hash(prev_hash, merkle, ts, nonce, diff)
-            if meets_difficulty(h, diff):
-                break
-            nonce += 1
-            if nonce % 200000 == 0:
-                ts = int(time.time())
-        block = {"height": height, "hash": h, "prev_hash": prev_hash,
+
+        nonce, h_hex, _ = _pow_search(prev_hash, merkle, ts, diff)
+        block = {"height": height, "hash": h_hex, "prev_hash": prev_hash,
                  "timestamp": ts, "nonce": nonce, "merkle": merkle,
                  "difficulty": diff, "transactions": txs}
+        self._attach_auth_tag(block)
         ok, msg = self.accept_block(block)
         return block if ok else None
 
-    def mine_block_interruptible(self, miner_address, miner_pubkey, should_continue=None):
+    def mine_block_interruptible(self, miner_address, miner_pubkey,
+                                  should_continue=None, progress_cb=None):
         if not miner_pubkey:
-            raise ValueError(
-                "mine_block_interruptible: miner_pubkey é obrigatória"
-            )
+            raise ValueError("mine_block_interruptible: miner_pubkey é obrigatória")
         height = self.db.height() + 1
         reward = self.current_reward(height)
         diff = self.current_difficulty()
@@ -531,25 +720,23 @@ class Blockchain:
         merkle = compute_merkle_root([t["txid"] for t in txs])
         prev_hash = self.db.tip_hash()
         ts = int(time.time())
-        nonce = 0
-        while True:
-            if should_continue is not None and not should_continue():
-                return None
-            h = block_hash(prev_hash, merkle, ts, nonce, diff)
-            if meets_difficulty(h, diff):
-                break
-            nonce += 1
-            if nonce % 50000 == 0:
-                ts = int(time.time())
-            # v7.1.2: libera o GIL a cada 10k iteracoes para o Flask responder
-            if nonce % 10000 == 0:
-                time.sleep(0)
-        block = {"height": height, "hash": h, "prev_hash": prev_hash,
+
+        nonce, h_hex, _ = _pow_search(prev_hash, merkle, ts, diff,
+                                       should_continue=should_continue,
+                                       progress_cb=progress_cb)
+        if nonce is None:
+            return None
+
+        block = {"height": height, "hash": h_hex, "prev_hash": prev_hash,
                  "timestamp": ts, "nonce": nonce, "merkle": merkle,
                  "difficulty": diff, "transactions": txs}
+        self._attach_auth_tag(block)
         ok, msg = self.accept_block(block)
         return block if ok else None
 
+    # --------------------------------------------------------
+    # CONFIRMAÇÕES
+    # --------------------------------------------------------
     def get_latest_height(self) -> int:
         return self.db.height()
 
@@ -560,10 +747,12 @@ class Blockchain:
         tx_height = self.get_transaction_block_height(txid)
         if tx_height == -1:
             return 0
-        current_height = self.get_latest_height()
-        return current_height - tx_height
+        return self.get_latest_height() - tx_height
 
 
+# ------------------------------------------------------------
+# Plug do chain_validator
+# ------------------------------------------------------------
 try:
     from chain_validator import verify_chain as _verify_ext
 
