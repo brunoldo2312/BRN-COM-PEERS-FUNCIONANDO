@@ -1,7 +1,7 @@
 """db.py — Banco SQLite do BRN (v6)
 v4: + delete_blocks_above, + get_blocks_range, + peer score
 v5: + get_next_nonce, + get_nonce_for_pubkey (protecao replay)
-v6: + L2 tables (l2_escrows, btc_used, l2_blocks, l2_txs) + BTC->BRN escrow
+v6: + contratos inteligentes + L2 (BTC->BRN)
 """
 import time
 import zlib
@@ -9,6 +9,7 @@ import sqlite3
 import threading
 import orjson
 import json
+
 
 class ChainDB:
     def __init__(self, path: str):
@@ -33,10 +34,12 @@ class ChainDB:
             );
             CREATE INDEX IF NOT EXISTS idx_blocks_hash ON blocks(hash);
             CREATE INDEX IF NOT EXISTS idx_blocks_prev ON blocks(prev_hash);
+
             CREATE TABLE IF NOT EXISTS transactions (
                 txid TEXT PRIMARY KEY, block_height INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_tx_block ON transactions(block_height);
+
             CREATE TABLE IF NOT EXISTS utxos (
                 txid TEXT NOT NULL, vout INTEGER NOT NULL,
                 address TEXT NOT NULL, amount INTEGER NOT NULL,
@@ -47,13 +50,16 @@ class ChainDB:
             CREATE INDEX IF NOT EXISTS idx_utxo_addr ON utxos(address, spent);
             CREATE INDEX IF NOT EXISTS idx_utxo_spent ON utxos(spent);
             CREATE INDEX IF NOT EXISTS idx_utxo_h ON utxos(block_height);
+
             CREATE TABLE IF NOT EXISTS mempool (
                 txid TEXT PRIMARY KEY, raw BLOB NOT NULL,
                 fee INTEGER NOT NULL, received_at REAL NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_mp_fee ON mempool(fee DESC);
             CREATE INDEX IF NOT EXISTS idx_mp_time ON mempool(received_at);
+
             CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+
             CREATE TABLE IF NOT EXISTS peers (
                 address TEXT PRIMARY KEY NOT NULL, node_id TEXT NOT NULL,
                 genesis_hash TEXT NOT NULL, version TEXT,
@@ -65,14 +71,42 @@ class ChainDB:
             CREATE INDEX IF NOT EXISTS idx_peers_last_seen ON peers(last_seen);
             CREATE INDEX IF NOT EXISTS idx_peers_genesis ON peers(genesis_hash);
             CREATE INDEX IF NOT EXISTS idx_peers_node_id ON peers(node_id);
+
             CREATE TABLE IF NOT EXISTS network_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp INTEGER NOT NULL, event_type TEXT NOT NULL,
                 peer_address TEXT, details TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_events_ts ON network_events(timestamp DESC);
-            
-            -- v6 L2 TABLES --
+
+            -- v6: CONTRATOS INTELIGENTES
+            CREATE TABLE IF NOT EXISTS contracts (
+                contract_id TEXT PRIMARY KEY,
+                owner TEXT NOT NULL,
+                code TEXT NOT NULL,
+                metadata TEXT,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_contracts_owner ON contracts(owner);
+            CREATE INDEX IF NOT EXISTS idx_contracts_created ON contracts(created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS contract_state (
+                contract_id TEXT PRIMARY KEY,
+                state TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS contract_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                contract_id TEXT NOT NULL,
+                event TEXT NOT NULL,
+                data TEXT,
+                timestamp INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_contract_events_id
+                ON contract_events(contract_id, timestamp DESC);
+
+            -- v6: L2 (BTC -> BRN)
             CREATE TABLE IF NOT EXISTS l2_escrows (
                 escrow_id TEXT PRIMARY KEY,
                 creator TEXT,
@@ -89,20 +123,20 @@ class ChainDB:
             );
             CREATE INDEX IF NOT EXISTS idx_l2_status ON l2_escrows(status);
             CREATE INDEX IF NOT EXISTS idx_l2_buyer ON l2_escrows(buyer);
-            
+
             CREATE TABLE IF NOT EXISTS btc_used (
                 btc_txid TEXT PRIMARY KEY,
                 escrow_id TEXT,
                 used_at INTEGER
             );
-            
+
             CREATE TABLE IF NOT EXISTS l2_blocks (
                 merkle_root TEXT PRIMARY KEY,
                 timestamp INTEGER,
                 count INTEGER,
                 raw_json TEXT
             );
-            
+
             CREATE TABLE IF NOT EXISTS l2_txs (
                 txid TEXT PRIMARY KEY,
                 type TEXT,
@@ -245,7 +279,7 @@ class ChainDB:
                 self.conn.execute("ROLLBACK")
                 raise
 
-    # ==================== NONCE / REPLAY PROTECTION (v5) ====================
+    # ==================== NONCE / REPLAY PROTECTION ====================
     def get_next_nonce(self, address: str) -> int:
         row = self.conn.execute(
             "SELECT COUNT(*) AS c FROM utxos WHERE address=? AND spent=1",
@@ -302,11 +336,11 @@ class ChainDB:
         fees = self.conn.execute("SELECT fee FROM mempool ORDER BY fee DESC LIMIT 100").fetchall()
         return {"count": row["c"], "sum_fee": row["sf"], "fees": [f["fee"] for f in fees]}
 
-    # ==================== L2 - BTC->BRN (v6) ====================
+    # ==================== L2 - BTC->BRN ====================
     def save_l2_escrow(self, escrow_dict):
         with self.lock:
             self.conn.execute("""
-                INSERT OR REPLACE INTO l2_escrows 
+                INSERT OR REPLACE INTO l2_escrows
                 (escrow_id, creator, buyer, brn_amount, btc_expected_sats, btc_address, btc_txid, status, created_at, expires_at, l2_hash, raw_json)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
@@ -333,7 +367,7 @@ class ChainDB:
         for r in rows:
             try:
                 result.append(json.loads(r["raw_json"]))
-            except:
+            except Exception:
                 pass
         return result
 
@@ -342,7 +376,7 @@ class ChainDB:
         if row:
             try:
                 return json.loads(row["raw_json"])
-            except:
+            except Exception:
                 return None
         return None
 
@@ -388,6 +422,7 @@ class ChainDB:
         return {"height": self.height(), "tip_hash": self.tip_hash(),
                 "utxos": self.count_utxos(), "mempool": self.mempool_count(),
                 "blocks": self.height() + 1,
+                "contracts": self.contract_count(),
                 "l2_escrows": self.conn.execute("SELECT COUNT(*) as c FROM l2_escrows").fetchone()["c"],
                 "l2_txs": self.conn.execute("SELECT COUNT(*) as c FROM l2_txs").fetchone()["c"]}
 
@@ -403,6 +438,7 @@ class ChainDB:
         with self.lock:
             self.conn.execute("VACUUM")
 
+    # ==================== META ====================
     def set_meta(self, key, value):
         with self.lock:
             self.conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)", (key, value))
@@ -411,6 +447,7 @@ class ChainDB:
         row = self.conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
         return row["value"] if row else None
 
+    # ==================== PEERS ====================
     def upsert_peer(self, node_id, address, genesis_hash, version="?", height=0,
                     is_miner=False, public_key="", metadata=None):
         with self.lock:
@@ -449,6 +486,199 @@ class ChainDB:
     def listar_peers(self, apenas_ativos=True, janela=300):
         if apenas_ativos:
             cutoff = int(time.time()) - janela
-            rows = self.conn.execute("SELECT * FROM peers WHERE last_seen >= ? ORDER BY last_seen DESC", (cutoff,)).fetchall()
+            rows = self.conn.execute(
+                "SELECT * FROM peers WHERE last_seen >= ? ORDER BY last_seen DESC",
+                (cutoff,)).fetchall()
         else:
-            rows = self.conn.execute("SELECT *
+            rows = self.conn.execute(
+                "SELECT * FROM peers ORDER BY last_seen DESC").fetchall()
+        return [dict(r) for r in rows]
+
+    def listar_peers_maus(self, score_min=-100):
+        rows = self.conn.execute("SELECT * FROM peers WHERE score < ?", (score_min,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def contar_peers(self, apenas_ativos=True, janela=300):
+        if apenas_ativos:
+            cutoff = int(time.time()) - janela
+            row = self.conn.execute("SELECT COUNT(*) AS n FROM peers WHERE last_seen >= ?", (cutoff,)).fetchone()
+        else:
+            row = self.conn.execute("SELECT COUNT(*) AS n FROM peers").fetchone()
+        return int(row["n"])
+
+    def remover_peer(self, node_id):
+        with self.lock:
+            self.conn.execute("DELETE FROM peers WHERE node_id=?", (node_id,))
+
+    def remover_peer_por_endereco(self, address):
+        with self.lock:
+            self.conn.execute("DELETE FROM peers WHERE address=?", (address,))
+
+    def limpar_peers_inativos(self, janela=1800):
+        with self.lock:
+            self.conn.execute("DELETE FROM peers WHERE last_seen < ?", (int(time.time()) - janela,))
+
+    # ==================== EVENTOS ====================
+    def _log_event(self, tipo, peer="", details=""):
+        with self.lock:
+            self.conn.execute("INSERT INTO network_events (timestamp, event_type, peer_address, details) VALUES (?,?,?,?)",
+                              (int(time.time()), tipo, peer, details))
+
+    def ultimos_eventos(self, n=50):
+        rows = self.conn.execute("SELECT * FROM network_events ORDER BY id DESC LIMIT ?", (n,)).fetchall()
+        return [dict(r) for r in rows]
+
+    # ==================== CONTRATOS INTELIGENTES (v6) ====================
+    def contract_insert(self, contract_id, owner, code, metadata=None):
+        with self.lock:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO contracts(contract_id, owner, code, metadata, created_at) "
+                "VALUES (?,?,?,?,?)",
+                (contract_id, owner,
+                 orjson.dumps(code).decode(),
+                 orjson.dumps(metadata or {}).decode(),
+                 int(time.time()))
+            )
+            self.conn.execute(
+                "INSERT OR REPLACE INTO contract_state(contract_id, state, updated_at) "
+                "VALUES (?,?,?)",
+                (contract_id, "{}", int(time.time()))
+            )
+
+    def contract_get(self, contract_id):
+        row = self.conn.execute(
+            "SELECT * FROM contracts WHERE contract_id=?", (contract_id,)
+        ).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        d["code"] = orjson.loads(d["code"])
+        d["metadata"] = orjson.loads(d["metadata"] or "{}")
+        return d
+
+    def contract_list(self, owner=None, limit=100):
+        if owner:
+            rows = self.conn.execute(
+                "SELECT * FROM contracts WHERE owner=? ORDER BY created_at DESC LIMIT ?",
+                (owner, limit)
+            ).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM contracts ORDER BY created_at DESC LIMIT ?",
+                (limit,)
+            ).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["code"] = orjson.loads(d["code"])
+            d["metadata"] = orjson.loads(d["metadata"] or "{}")
+            out.append(d)
+        return out
+
+    def contract_count(self):
+        return self.conn.execute("SELECT COUNT(*) AS c FROM contracts").fetchone()["c"]
+
+    def contract_delete(self, contract_id):
+        with self.lock:
+            self.conn.execute("DELETE FROM contracts WHERE contract_id=?", (contract_id,))
+            self.conn.execute("DELETE FROM contract_state WHERE contract_id=?", (contract_id,))
+            self.conn.execute("DELETE FROM contract_events WHERE contract_id=?", (contract_id,))
+
+    def contract_get_state(self, contract_id):
+        row = self.conn.execute(
+            "SELECT state FROM contract_state WHERE contract_id=?", (contract_id,)
+        ).fetchone()
+        return orjson.loads(row["state"]) if row else {}
+
+    def contract_set_state(self, contract_id, state):
+        with self.lock:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO contract_state(contract_id, state, updated_at) "
+                "VALUES (?,?,?)",
+                (contract_id, orjson.dumps(state).decode(), int(time.time()))
+            )
+
+    def contract_log_event(self, contract_id, event, data):
+        with self.lock:
+            self.conn.execute(
+                "INSERT INTO contract_events(contract_id, event, data, timestamp) "
+                "VALUES (?,?,?,?)",
+                (contract_id, event,
+                 orjson.dumps(data).decode() if data is not None else "null",
+                 int(time.time()))
+            )
+
+    def contract_get_events(self, contract_id, limit=50):
+        rows = self.conn.execute(
+            "SELECT * FROM contract_events WHERE contract_id=? "
+            "ORDER BY id DESC LIMIT ?",
+            (contract_id, limit)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def contract_all_events(self, limit=200):
+        rows = self.conn.execute(
+            "SELECT * FROM contract_events ORDER BY id DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def contract_spend(self, from_addr: str, to_addr: str, amount: int):
+        """Move fundos de from_addr para to_addr. Chamado por contracts.py."""
+        import hashlib
+        import os as _os
+
+        with self.lock:
+            self.conn.execute("BEGIN IMMEDIATE TRANSACTION")
+            try:
+                rows = self.conn.execute(
+                    "SELECT txid, vout, amount FROM utxos "
+                    "WHERE address=? AND spent=0 ORDER BY amount DESC",
+                    (from_addr,)
+                ).fetchall()
+
+                total = 0
+                sacados = []
+                for r in rows:
+                    total += r["amount"]
+                    sacados.append((r["txid"], r["vout"], r["amount"]))
+                    if total >= amount:
+                        break
+
+                if total < amount:
+                    raise ValueError(f"saldo insuficiente: {total} < {amount}")
+
+                seed = (
+                    f"{from_addr}|{to_addr}|{amount}|{total}|"
+                    f"{time.time_ns()}|{_os.urandom(8).hex()}"
+                ).encode()
+                txid_base = hashlib.sha256(seed).hexdigest()
+
+                for txid, vout, _amt in sacados:
+                    self.conn.execute(
+                        "UPDATE utxos SET spent=1, spent_by=? WHERE txid=? AND vout=?",
+                        (txid_base, txid, vout)
+                    )
+
+                self.conn.execute(
+                    "INSERT INTO utxos(txid, vout, address, amount, pubkey, "
+                    "block_height, spent) VALUES (?,?,?,?,?,?,0)",
+                    (txid_base, 0, to_addr, amount, "", self.height())
+                )
+
+                troco = total - amount
+                if troco > 0:
+                    self.conn.execute(
+                        "INSERT INTO utxos(txid, vout, address, amount, pubkey, "
+                        "block_height, spent) VALUES (?,?,?,?,?,?,0)",
+                        (txid_base, 1, from_addr, troco, "", self.height())
+                    )
+
+                self.conn.execute("COMMIT")
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
+
+    # ==================== CLOSE ====================
+    def close(self):
+        self.conn.close()
