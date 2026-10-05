@@ -1,16 +1,26 @@
-"""server.py — Backend HTTP do no BRN (v8.9)
+"""server.py — Backend HTTP do no BRN (v8.9.1)
+v8.9.1: [CRITICO] /api/sync-info nao chama mais cumulative_work().
+        Corrige erro 500 (zlib -5) por concorrencia com o miner.
+        Cada bloco do handler tem try/except individual — sempre
+        retorna JSON valido, mesmo se uma sub-consulta falhar.
+
 v8.9: + endpoints L2 (bridge BTC -> BRN) integrados ao v8.8.
       L2Manager carregado em lazy-load; se ausente, os endpoints L2
       retornam 400 sem derrubar o resto do servidor.
-      Endpoints: /api/l2/quote, /api/l2/create, /api/l2/order/<id>,
-                 /api/l2/list, /api/l2/stats, /api/l2/cancel/<id>
+
 v8.8: + /api/tx-status/<txid>
       + /api/verificar-recebimento/<addr>/<txid>
+
 v8.7: _pubkey_from_db_or_payload consulta current_wallet.json.
+
 v8.6: + /api/minhas-txs/<addr>.
+
 v8.5: _pubkey_from_db_or_payload consulta user_wallets.json.
+
 v8.4: + /api/miner/start e /api/miner/stop (miner_loop singleton).
+
 v8.3: + contratos, sync-info, miner/status.
+
 v8.0: - removida bridge.
 """
 from flask import Flask, request, jsonify
@@ -32,7 +42,7 @@ WALLETS_FILE = "user_wallets.json"
 CURRENT_WALLET_FILE = "current_wallet.json"
 
 # ============================================================
-# v8.9: L2 (bridge BTC -> BRN) — imports opcionais
+# L2 (bridge BTC -> BRN) — imports opcionais
 # ============================================================
 try:
     from l2_manager import L2Manager
@@ -158,14 +168,6 @@ def _registrar_pubkey(addr, pk):
 # ============================================================
 def _pubkey_from_db_or_payload(addr: str, payload_pubkey: str = "",
                                payload_sk: str = "") -> str:
-    """
-    Ordem de prioridade:
-      1. payload_pubkey          (JS manda no POST)
-      2. payload_sk -> deriva    (JS manda no POST)
-      3. current_wallet.json     (persistido pelo app_wallet_v3)
-      4. user_wallets.json       (persistido por /api/nova-carteira)
-      5. tabela utxos            (se a carteira ja minerou/recebeu)
-    """
     if payload_pubkey:
         return payload_pubkey.strip()
 
@@ -330,7 +332,6 @@ def transacoes(address):
 def minhas_txs(address):
     try:
         altura = CHAIN.db.height()
-
         try:
             meus_utxos = CHAIN.db.get_utxos(address)
         except Exception:
@@ -788,27 +789,33 @@ def faucet():
 # ============================================================
 @app.route("/api/chain-info", methods=["GET"])
 def chain_info():
-    return jsonify({
-        "success": True, "name": "BrunoCoin", "ticker": "BRN",
-        "height": CHAIN.db.height(), "tip_hash": CHAIN.db.tip_hash(),
-        "reward": CHAIN.current_reward(CHAIN.db.height() + 1),
-        "difficulty": CHAIN.current_difficulty(),
-    })
+    try:
+        return jsonify({
+            "success": True, "name": "BrunoCoin", "ticker": "BRN",
+            "height": CHAIN.db.height(), "tip_hash": CHAIN.db.tip_hash(),
+            "reward": CHAIN.current_reward(CHAIN.db.height() + 1),
+            "difficulty": CHAIN.current_difficulty(),
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 @app.route("/api/status", methods=["GET"])
 def status():
-    return jsonify({
-        "name": "BrunoCoin", "ticker": "BRN",
-        "height": CHAIN.db.height(), "tip_hash": CHAIN.db.tip_hash(),
-        "utxos": CHAIN.db.count_utxos(),
-        "mempool": len(CHAIN.db.all_mempool(limit=10000)),
-        "peers": CHAIN.db.contar_peers(apenas_ativos=True),
-        "reward": CHAIN.current_reward(CHAIN.db.height() + 1),
-        "difficulty": CHAIN.current_difficulty(),
-        "contracts": CHAIN.db.contract_count() if hasattr(CHAIN.db, "contract_count") else 0,
-        "l2_enabled": L2_ENABLED,
-    })
+    try:
+        return jsonify({
+            "name": "BrunoCoin", "ticker": "BRN",
+            "height": CHAIN.db.height(), "tip_hash": CHAIN.db.tip_hash(),
+            "utxos": CHAIN.db.count_utxos(),
+            "mempool": len(CHAIN.db.all_mempool(limit=10000)),
+            "peers": CHAIN.db.contar_peers(apenas_ativos=True),
+            "reward": CHAIN.current_reward(CHAIN.db.height() + 1),
+            "difficulty": CHAIN.current_difficulty(),
+            "contracts": CHAIN.db.contract_count() if hasattr(CHAIN.db, "contract_count") else 0,
+            "l2_enabled": L2_ENABLED,
+        })
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 # ============================================================
@@ -816,23 +823,32 @@ def status():
 # ============================================================
 @app.route("/api/fee-estimate", methods=["GET"])
 def fee_estimate():
-    return jsonify({"success": True,
-                    "low": CHAIN.estimate_fee("low"),
-                    "medium": CHAIN.estimate_fee("medium"),
-                    "high": CHAIN.estimate_fee("high"),
-                    "min_relay_fee": 1000})
+    try:
+        return jsonify({"success": True,
+                        "low": CHAIN.estimate_fee("low"),
+                        "medium": CHAIN.estimate_fee("medium"),
+                        "high": CHAIN.estimate_fee("high"),
+                        "min_relay_fee": 1000})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 @app.route("/api/work", methods=["GET"])
 def work():
-    return jsonify({"success": True, "height": CHAIN.db.height(),
-                    "cumulative_work": CHAIN.cumulative_work()})
+    try:
+        return jsonify({"success": True, "height": CHAIN.db.height(),
+                        "cumulative_work": CHAIN.cumulative_work()})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 @app.route("/api/nonce/<pubkey>", methods=["GET"])
 def get_nonce(pubkey):
-    return jsonify({"success": True, "pubkey": pubkey,
-                    "next_nonce": CHAIN.db.get_nonce_for_pubkey(pubkey)})
+    try:
+        return jsonify({"success": True, "pubkey": pubkey,
+                        "next_nonce": CHAIN.db.get_nonce_for_pubkey(pubkey)})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 # ============================================================
@@ -883,53 +899,97 @@ def peers_score():
 
 
 # ============================================================
-# SYNC INFO
+# SYNC INFO (v8.9.1)
 # ============================================================
 @app.route("/api/sync-info", methods=["GET"])
 def sync_info():
+    """
+    v8.9.1: NAO chama cumulative_work() — causava erro 500 (zlib -5)
+    por concorrencia com o miner. Cada bloco tem try/except individual.
+    Sempre retorna JSON valido, mesmo se uma sub-consulta falhar.
+    """
+    result = {
+        "ok": True,
+        "sync": {
+            "percent": 100.0,
+            "height": 0,
+            "target": 0,
+            "peers": 0,
+            "work": 0,
+        },
+        "miner_target": "",
+        "bridge": {
+            "onramp_ativo": False,
+            "offramp_ativo": False,
+            "taxa": 0,
+            "btc_cofre": "",
+        },
+        "bridge_onramp": {
+            "processados": 0,
+            "ultima_sync": None,
+        },
+    }
+
+    # 1) Altura local
     try:
-        peers = CHAIN.db.contar_peers(apenas_ativos=True)
         local_h = CHAIN.db.height()
-        local_work = CHAIN.cumulative_work()
-
-        target_h = local_h
-        try:
-            todos = CHAIN.db.listar_peers(apenas_ativos=False)
-            if todos:
-                heights = [p.get("height") or 0 for p in todos]
-                if heights:
-                    target_h = max(target_h, max(heights))
-        except Exception:
-            pass
-
-        if target_h <= 0:
-            percent = 100.0
-        else:
-            percent = min(100.0, round(local_h / target_h * 100, 2))
-
-        return jsonify({
-            "ok": True,
-            "sync": {
-                "percent": percent,
-                "height": local_h,
-                "target": target_h,
-                "peers": peers,
-                "work": local_work,
-            },
-            "miner_target": CHAIN.db.get_meta("miner_address") or "",
-            "bridge": {
-                "onramp_ativo": L2_ENABLED,
-                "offramp_ativo": False,
-                "taxa": getattr(btc_config, "BRN_PER_BTC", 0) if L2_ENABLED else 0,
-                "btc_cofre": getattr(btc_config, "BTC_RECEIVE_ADDRESS", "") if L2_ENABLED else "",
-            },
-            "bridge_onramp": {
-                "processados": 0,
-                "ultima_sync": None,
-            },
-        })
+        result["sync"]["height"] = local_h
     except Exception as e:
-        return jsonify({"ok": False, "erro": str(e)}), 500
+        result["ok"] = False
+        result["erro"] = f"height: {e}"
+        return jsonify(result), 200
+
+    # 2) Peers ativos
+    try:
+        result["sync"]["peers"] = CHAIN.db.contar_peers(apenas_ativos=True)
+    except Exception as e:
+        print(f"[sync-info] contar_peers: {e}")
+
+    # 3) Target = maior altura entre peers
+    target_h = local_h
+    try:
+        todos = CHAIN.db.listar_peers(apenas_ativos=False)
+        if todos:
+            heights = []
+            for p in todos:
+                try:
+                    h = p["height"] if isinstance(p, dict) else None
+                    if h:
+                        heights.append(int(h))
+                except Exception:
+                    continue
+            if heights:
+                target_h = max([target_h] + heights)
+    except Exception as e:
+        print(f"[sync-info] listar_peers: {e}")
+
+    result["sync"]["target"] = target_h
+
+    # 4) Percent
+    try:
+        if target_h <= 0:
+            result["sync"]["percent"] = 100.0
+        else:
+            result["sync"]["percent"] = min(100.0, round(local_h / target_h * 100, 2))
+    except Exception:
+        pass
+
+    # 5) Miner target
+    try:
+        result["miner_target"] = CHAIN.db.get_meta("miner_address") or ""
+    except Exception:
+        pass
+
+    # 6) Bridge (L2) — defensivo
+    try:
+        if L2_ENABLED and btc_config is not None:
+            result["bridge"]["onramp_ativo"] = True
+            result["bridge"]["taxa"] = int(getattr(btc_config, "BRN_PER_BTC", 0) or 0)
+            result["bridge"]["btc_cofre"] = getattr(btc_config, "BTC_RECEIVE_ADDRESS", "") or ""
+    except Exception as e:
+        print(f"[sync-info] bridge: {e}")
+
+    return jsonify(result), 200
 
 
 # ============================================================
@@ -1017,12 +1077,10 @@ def contracts_list():
 
 
 # ============================================================
-# v8.9 — L2 (bridge BTC -> BRN)
+# L2 (bridge BTC -> BRN)
 # ============================================================
-
 @app.route("/api/l2/quote", methods=["GET"])
 def l2_quote():
-    """GET /api/l2/quote?btc_sats=100000 -> cotacao sem criar ordem"""
     l2 = _get_l2()
     if not l2:
         return jsonify({"error": "L2 desabilitado - configure l2_manager.py e btc_config.py"}), 400
@@ -1041,7 +1099,6 @@ def l2_quote():
 @app.route("/api/l2/create", methods=["POST"])
 @_rate_limit
 def l2_create():
-    """POST /api/l2/create {"btc_sats":100000,"buyer_brn":"brn1q..."} -> cria escrow OPEN"""
     l2 = _get_l2()
     if not l2:
         return jsonify({"error": "L2 desabilitado"}), 400
@@ -1064,7 +1121,6 @@ def l2_create():
 
 @app.route("/api/l2/order/<escrow_id>", methods=["GET"])
 def l2_order(escrow_id):
-    """GET /api/l2/order/escrow_abc123 -> status OPEN / BTC_DETECTED / RELEASED"""
     l2 = _get_l2()
     if not l2:
         return jsonify({"error": "L2 desabilitado"}), 400
@@ -1087,7 +1143,6 @@ def l2_order(escrow_id):
 
 @app.route("/api/l2/list", methods=["GET"])
 def l2_list():
-    """GET /api/l2/list?buyer=brn1q...&status=OPEN"""
     l2 = _get_l2()
     if not l2:
         return jsonify({"error": "L2 desabilitado"}), 400
@@ -1159,18 +1214,21 @@ def l2_cancel(escrow_id):
 # ============================================================
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({
-        "ok": True,
-        "height": CHAIN.db.height(),
-        "l2_enabled": L2_ENABLED,
-    })
+    try:
+        return jsonify({
+            "ok": True,
+            "height": CHAIN.db.height(),
+            "l2_enabled": L2_ENABLED,
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.route("/", methods=["GET"])
 def index():
     return jsonify({
         "name": "BRN Node API",
-        "version": "8.9",
+        "version": "8.9.1",
         "endpoints": [
             "GET  /api/status",
             "GET  /api/chain-info",
@@ -1189,6 +1247,7 @@ def index():
             "POST /api/contract/deploy",
             "POST /api/contract/call",
             "GET  /api/contracts",
+            "GET  /api/sync-info",
             "GET  /api/l2/quote?btc_sats=100000",
             "POST /api/l2/create",
             "GET  /api/l2/order/<escrow_id>",
@@ -1205,7 +1264,7 @@ def index():
 # ============================================================
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print(f"BRN Server v8.9 - http://0.0.0.0:{port}")
+    print(f"BRN Server v8.9.1 - http://0.0.0.0:{port}")
     print(f"  L2 (bridge BTC->BRN): {'ATIVO' if L2_ENABLED else 'DESABILITADO'}")
 
     try:
