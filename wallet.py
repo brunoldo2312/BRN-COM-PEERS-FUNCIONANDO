@@ -1,13 +1,15 @@
 """
-wallet.py — Carteira BRN (v7 - FINAL)
+wallet.py — Carteira BRN (v8 - FINAL)
 ================================================================
-v7:
-  - Base v6 intacta (secure_store Argon2id + ChaCha20 + 0600 + atomico)
-  - ADDON: Infisical - puxa BRN_PRIVATE_KEY do cloud criptografado
+v8:
+  - Base v7 intacta (secure_store Argon2id + ChaCha20 + 0600 + atomico)
+  - ADDON: current_wallet.enc (carteira ativa CIFRADA, não mais texto puro)
+  - ADDON: WalletSession com auto-lock em RAM (15 min)
   - ADDON: copy_to_clipboard - copia endereco/txid/seed 1 clique
-  - Compatível com seu .bat de 1 clique
+  - ADDON: Infisical - puxa BRN_PRIVATE_KEY do cloud criptografado
+  - Compatível com .bat de 1 clique
 
-v6: Armazenamento local via secure_store.py
+v7: Armazenamento local via secure_store.py
 v5: HDWalletManager BIP39 + BIP44
 ================================================================
 """
@@ -27,12 +29,20 @@ from crypto import (
 from bech32 import address_from_pubkey
 
 from secure_store import (
+    # ---- v7 (inalterado) ----
     encrypt_blob as _ss_encrypt,
     decrypt_blob as _ss_decrypt,
     MAGIC as _SS_MAGIC,
+    # ---- v8 (novo) ----
+    WalletSession,
+    save_current_wallet   as _ss_save_current,
+    load_current_wallet   as _ss_load_current,
+    migrate_current_wallet as _ss_migrate_current,
+    constant_time_eq,
 )
 
 SIG_MODE = "schnorr"
+
 
 # ============================================================
 # ADDON - COPIAR PARA ÁREA DE TRANSFERÊNCIA
@@ -47,7 +57,7 @@ def copy_to_clipboard(texto: str) -> bool:
         pyperclip.copy(texto)
         print(f"[wallet] [ok] Copiado: {texto[:12]}...{texto[-6:]}")
         return True
-    except:
+    except Exception:
         pass
     try:
         sistema = platform.system()
@@ -62,7 +72,7 @@ def copy_to_clipboard(texto: str) -> bool:
                 try:
                     subprocess.run(cmd, input=texto.encode('utf-8'), check=True, shell=True)
                     return True
-                except:
+                except Exception:
                     continue
             import tkinter as tk
             r = tk.Tk(); r.withdraw(); r.clipboard_clear(); r.clipboard_append(texto); r.update(); r.destroy()
@@ -72,6 +82,7 @@ def copy_to_clipboard(texto: str) -> bool:
         print(f"[wallet] Copie manualmente: {texto}")
         return False
 
+
 # ============================================================
 # ADDON - INFISICAL (puxa chave segura sem expor no GitHub)
 # ============================================================
@@ -79,16 +90,16 @@ def _get_secret_infisical(secret_name: str):
     try:
         from dotenv import load_dotenv
         load_dotenv()
-    except:
+    except Exception:
         pass
     try:
         import requests
-    except:
+    except Exception:
         return None
 
-    token = os.getenv("INFISICAL_TOKEN")
+    token      = os.getenv("INFISICAL_TOKEN")
     project_id = os.getenv("INFISICAL_PROJECT_ID")
-    env = os.getenv("INFISICAL_ENV", "dev")
+    env        = os.getenv("INFISICAL_ENV", "dev")
 
     if not token or not project_id:
         return None
@@ -97,17 +108,23 @@ def _get_secret_infisical(secret_name: str):
 
     try:
         url = "https://app.infisical.com/api/v3/secrets/raw"
-        params = {"secretName": secret_name, "workspaceId": project_id, "environment": env, "secretPath": "/"}
+        params = {
+            "secretName": secret_name,
+            "workspaceId": project_id,
+            "environment": env,
+            "secretPath": "/",
+        }
         headers = {"Authorization": f"Bearer {token}"}
         r = requests.get(url, params=params, headers=headers, timeout=10)
         if r.status_code == 200:
             return r.json()["secret"]["secretValue"]
-    except:
+    except Exception:
         pass
     return None
 
+
 def get_secure_brn_key():
-    """Tenta Infisical primeiro, depois .env local"""
+    """Tenta Infisical primeiro, depois .env local."""
     for nome in ["BRN_PRIVATE_KEY", "BTC_WIF", "BTC_SEED", "BRN_WIF"]:
         v = _get_secret_infisical(nome)
         if v and len(v) > 10:
@@ -120,8 +137,9 @@ def get_secure_brn_key():
             return v
     return None
 
+
 # ============================================================
-# WALLET SIMPLES (chave unica) - v6 ORIGINAL INTACTO
+# WALLET SIMPLES (chave unica)
 # ============================================================
 class Wallet:
     def __init__(self, private_key_hex: str | None = None):
@@ -129,7 +147,7 @@ class Wallet:
             self.priv = bytes.fromhex(private_key_hex)
         else:
             self.priv = generate_private_key()
-        self.pub = pubkey_from_priv(self.priv)
+        self.pub     = pubkey_from_priv(self.priv)
         self.address = address_from_pubkey(self.pub)
 
     @property
@@ -184,8 +202,8 @@ class Wallet:
     def to_dict(self) -> dict:
         return {
             "private_key": self.priv_hex,
-            "address": self.address,
-            "pubkey": self.pub_hex,
+            "address":     self.address,
+            "pubkey":      self.pub_hex,
         }
 
     @classmethod
@@ -193,7 +211,7 @@ class Wallet:
         return cls(private_key_hex=d["private_key"])
 
     # --------------------------------------------------------
-    # v6: CIFRAGEM LOCAL
+    # CIFRAGEM LOCAL
     # --------------------------------------------------------
     def export_encrypted(self, password: str) -> str:
         data = json.dumps(self.to_dict(), separators=(",", ":"), sort_keys=True).encode("utf-8")
@@ -228,20 +246,23 @@ class Wallet:
 
 
 # ============================================================
-# WALLET MANAGER - v6 ORIGINAL INTACTO + COPIAR
+# WALLET MANAGER
 # ============================================================
 class WalletManager:
     WALLETS_DIR = os.environ.get("BRN_WALLETS_DIR", "wallets")
 
+    # ---------- Diretório ----------
     @staticmethod
     def _garantir_dir():
         os.makedirs(WalletManager.WALLETS_DIR, exist_ok=True)
 
+    # ---------- Geração ----------
     @staticmethod
     def generate_keypair() -> dict:
         w = Wallet()
         return {"address": w.address, "private_key": w.priv_hex, "public_key": w.pub_hex}
 
+    # ---------- Validação ----------
     @staticmethod
     def validate_address(addr: str) -> bool:
         try:
@@ -250,6 +271,7 @@ class WalletManager:
         except Exception:
             return isinstance(addr, str) and addr.startswith("brn1") and len(addr) > 20
 
+    # ---------- Escrita atômica (texto) ----------
     @staticmethod
     def _atomic_write(path: str, content: str) -> None:
         tmp = path + ".tmp"
@@ -261,14 +283,16 @@ class WalletManager:
                 os.fsync(f.fileno())
         except Exception:
             try: os.unlink(tmp)
-            except: pass
+            except Exception: pass
             raise
         os.replace(tmp, path)
         try: os.chmod(path, 0o600)
-        except: pass
+        except Exception: pass
 
+    # ---------- Carteiras nomeadas (wallets/<nome>.wallet) ----------
     @staticmethod
-    def save_encrypted_wallet(filename: str, password: str, address: str, sk: str, pk: str) -> dict:
+    def save_encrypted_wallet(filename: str, password: str,
+                              address: str, sk: str, pk: str) -> dict:
         try:
             WalletManager._garantir_dir()
             if not filename.endswith(".wallet"):
@@ -282,7 +306,8 @@ class WalletManager:
             return {"ok": False, "msg": str(e)}
 
     @staticmethod
-    def load_encrypted_wallet(filename: str, password: str, auto_migrate: bool = True) -> dict:
+    def load_encrypted_wallet(filename: str, password: str,
+                              auto_migrate: bool = True) -> dict:
         try:
             if not filename.endswith(".wallet"):
                 filename += ".wallet"
@@ -294,10 +319,11 @@ class WalletManager:
                 try:
                     new_blob = w.export_encrypted(password)
                     WalletManager._atomic_write(path, new_blob)
-                    print(f"[wallet] migrado para formato v6: {path}")
+                    print(f"[wallet] migrado para formato v8: {path}")
                 except Exception as e:
                     print(f"[wallet] aviso: falha ao migrar {path}: {e}")
-            return {"ok": True, "address": w.address, "private_key": w.priv_hex, "public_key": w.pub_hex}
+            return {"ok": True, "address": w.address,
+                    "private_key": w.priv_hex, "public_key": w.pub_hex}
         except Exception as e:
             return {"ok": False, "msg": str(e)}
 
@@ -310,22 +336,83 @@ class WalletManager:
                 if not fname.endswith(".wallet"):
                     continue
                 path = os.path.join(WalletManager.WALLETS_DIR, fname)
-                out.append({"filename": fname, "size": os.path.getsize(path), "modified": os.path.getmtime(path)})
+                out.append({
+                    "filename": fname,
+                    "size": os.path.getsize(path),
+                    "modified": os.path.getmtime(path),
+                })
             return out
         except Exception:
             return []
 
     @staticmethod
     def copy_wallet_address(filename: str, password: str) -> bool:
-        """Carrega e copia endereço - 1 clique"""
         res = WalletManager.load_encrypted_wallet(filename, password)
         if res.get("ok"):
             return copy_to_clipboard(res["address"])
         return False
 
+    # ============================================================
+    # v8: CARTEIRA ATIVA CIFRADA (current_wallet.enc)
+    # ============================================================
+    @staticmethod
+    def save_current(address: str, sk: str, pk: str, password: str) -> dict:
+        """Grava a carteira ativa CIFRADA (substitui current_wallet.json)."""
+        return _ss_save_current(password, {
+            "address":     address,
+            "private_key": sk,
+            "public_key":  pk,
+        })
+
+    @staticmethod
+    def load_current(password: str) -> dict:
+        """Carrega a carteira ativa cifrada."""
+        return _ss_load_current(password)
+
+    @staticmethod
+    def migrate_legacy_current(password: str) -> dict:
+        """Migra current_wallet.json legado → current_wallet.enc."""
+        return _ss_migrate_current(password)
+
+    # ============================================================
+    # v8: SESSÃO EM RAM COM AUTO-LOCK
+    # ============================================================
+    _session: "WalletSession | None" = None
+
+    @classmethod
+    def session(cls) -> WalletSession:
+        if cls._session is None:
+            cls._session = WalletSession(ttl=15 * 60)
+        return cls._session
+
+    @classmethod
+    def unlock_session(cls, password: str) -> dict:
+        """Carrega a carteira cifrada e coloca em RAM com TTL de 15 min."""
+        r = cls.load_current(password)
+        if not r.get("ok"):
+            return r
+        cls.session().unlock({
+            "address":     r.get("address", ""),
+            "private_key": r.get("private_key", ""),
+            "public_key":  r.get("public_key", ""),
+        })
+        return {"ok": True, "seconds_until_lock": cls.session().seconds_until_lock()}
+
+    @classmethod
+    def lock_session(cls) -> None:
+        cls.session().lock()
+
+    @classmethod
+    def session_wallet(cls) -> dict | None:
+        return cls.session().get()
+
+    @classmethod
+    def session_seconds_left(cls) -> int:
+        return cls.session().seconds_until_lock()
+
 
 # ============================================================
-# HD WALLET (BIP39 + BIP44) - v6 ORIGINAL INTACTO
+# HD WALLET (BIP39 + BIP44)
 # ============================================================
 class HDWalletManager:
     PURPOSE = 44
@@ -357,7 +444,13 @@ class HDWalletManager:
         I = hmac_lib.new(b"Bitcoin seed", seed, hashlib.sha512).digest()
         master_key = int.from_bytes(I[:32], "big")
         master_chain = I[32:]
-        path = [HDWalletManager.PURPOSE + 0x80000000, HDWalletManager.COIN_TYPE + 0x80000000, HDWalletManager.ACCOUNT + 0x80000000, HDWalletManager.CHANGE, index]
+        path = [
+            HDWalletManager.PURPOSE + 0x80000000,
+            HDWalletManager.COIN_TYPE + 0x80000000,
+            HDWalletManager.ACCOUNT + 0x80000000,
+            HDWalletManager.CHANGE,
+            index,
+        ]
         key = master_key
         chain = master_chain
         for child in path:
@@ -372,7 +465,14 @@ class HDWalletManager:
                 raise ValueError("derivacao BIP32 produziu chave invalida")
             chain = I[32:]
         w = Wallet(private_key_hex=key.to_bytes(32, "big").hex())
-        return {"mnemonic": mnemonic_phrase, "address": w.address, "private_key": w.priv_hex, "public_key": w.pub_hex, "index": index, "path": f"m/44'/{HDWalletManager.COIN_TYPE}'/0'/0/{index}"}
+        return {
+            "mnemonic":    mnemonic_phrase,
+            "address":     w.address,
+            "private_key": w.priv_hex,
+            "public_key":  w.pub_hex,
+            "index":       index,
+            "path": f"m/44'/{HDWalletManager.COIN_TYPE}'/0'/0/{index}",
+        }
 
     @staticmethod
     def derive_many(mnemonic_phrase, count=5):
@@ -411,7 +511,7 @@ def sign_transaction(wallet: Wallet, tx: dict) -> dict:
     return tx
 
 
-def verify_transaction(tx: dict) -> tuple[bool, str]:
+def verify_transaction(tx: dict) -> tuple:
     try:
         from blockchain import signing_hash
         h = signing_hash(tx)
@@ -427,10 +527,11 @@ def verify_transaction(tx: dict) -> tuple[bool, str]:
         return False, str(e)
 
 
-def sign_and_verify(wallet: Wallet, tx: dict) -> tuple[dict, bool, str]:
+def sign_and_verify(wallet: Wallet, tx: dict) -> tuple:
     signed = sign_transaction(wallet, tx)
     ok, msg = verify_transaction(signed)
     return signed, ok, msg
+
 
 # ============================================================
 # FUNÇÕES RÁPIDAS PARA .BAT (1 CLIQUE)
@@ -443,33 +544,41 @@ def quick_copy_address():
         copy_to_clipboard(w.address)
         print(w.address)
         return w.address
-    # Se não tem chave no Infisical, tenta carregar wallet padrão
+
     try:
-        res = WalletManager.load_encrypted_wallet("default.wallet", os.getenv("BRN_NODE_PASSWORD", "senha-da-carteira-2026"))
-        if res.get("ok"):
-            copy_to_clipboard(res["address"])
-            print(res["address"])
-            return res["address"]
-    except:
+        pw = os.getenv("BRN_WALLET_SESSION_PASS", "").strip()
+        if pw:
+            res = WalletManager.load_current(pw)
+            if res.get("ok"):
+                copy_to_clipboard(res["address"])
+                print(res["address"])
+                return res["address"]
+    except Exception:
         pass
+
     print("[wallet] Nenhuma carteira encontrada")
     return None
 
+
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="BRN Wallet v7")
+    parser = argparse.ArgumentParser(description="BRN Wallet v8")
     parser.add_argument("--copy", action="store_true", help="Copia endereço")
     parser.add_argument("--copy-txid", type=str, help="Copia TXID")
+    parser.add_argument("--migrate-current", metavar="SENHA",
+                        help="Migra current_wallet.json para .enc (UMA VEZ)")
     args = parser.parse_args()
-    
+
     if args.copy:
         quick_copy_address()
     elif args.copy_txid:
         copy_to_clipboard(args.copy_txid)
         print(f"TXID copiado: {args.copy_txid}")
+    elif args.migrate_current:
+        r = WalletManager.migrate_legacy_current(args.migrate_current)
+        print(r)
     else:
-        # Teste rápido
-        print("BRN Wallet v7 - OK")
+        print("BRN Wallet v8 - OK")
         sk = get_secure_brn_key()
         if sk:
             w = Wallet(private_key_hex=sk)
