@@ -1,23 +1,24 @@
 """
-main.py — Entrypoint unificado do nó BRN (v8.3 L2 MINERADO + Checkpoints)
+main.py — Entrypoint unificado do nó BRN (v10.1)
+================================================================
+FUSÃO do main.py v8.3 (L2/BTC + Checkpoints) com v10 (Segurança HTTP).
 
-v8.3 CHECKPOINTS:
-    - Carrega checkpoints assinados (checkpoints.json) no boot
-    - No nó-origem: ativa assinatura de novos checkpoints
-    - No nó-cliente: apenas valida checkpoints recebidos
+Herança v8.3:
+  - L2 MINERADO (BTC->BRN validado por PoW)
+  - Fallback TOTAL de L2 (nunca derruba o nó)
+  - Checkpoints assinados (Ed25519)
+  - --client-mode com espera de genesis
+  - Diagnóstico rico (--status, --discover, --l2-stats, --check-update)
 
-v8.2 FALLBACK:
-    - TODOS os pontos de uso do L2/BTC estao protegidos por try/except
-    - Se btc_watcher/l2_manager falharem (import ou runtime),
-      o no continua funcionando normalmente
-    - L2_ENABLED vira False automaticamente em qualquer falha
-    - Nenhum erro de BTC derruba o no
-
-v8.1 L2 MINERADO:
-    - Merge v6.1 + L2 BTC->BRN validado por mineracao
-    - --l2: ativa watcher BTC RPC (so confirma, validacao por PoW)
-    - --mine: ativa mineracao que prioriza TXs L2
-    - Watcher envia para mempool, blockchain so libera apos bloco minerado
+Adições v10.1:
+  - [SEGURANÇA] Audit log de boot/shutdown integrado (security.py)
+  - [SEGURANÇA] HTTPS autoassinado opcional (BRN_HTTPS=1)
+  - [SEGURANÇA] Verificação de integridade no boot (_verify_chain_or_die)
+  - [SEGURANÇA] Bootstrap de brn_network.env antes de tudo
+  - [SEGURANÇA] Auto-detecção hub vs cliente (_is_origin)
+  - [SEGURANÇA] Tracking de serviços para shutdown limpo
+  - [SEGURANÇA] Lock da WalletSession ao encerrar
+================================================================
 """
 import os
 import sys
@@ -32,6 +33,32 @@ import urllib.request
 import urllib.error
 from pathlib import Path
 
+
+# ============================================================
+# BOOTSTRAP — carrega env ANTES de importar brn_config
+# ============================================================
+def _bootstrap_env():
+    """Carrega brn_network.env (formato KEY=VALUE) sem sobrescrever o que já existe."""
+    env_file = Path("brn_network.env")
+    if not env_file.exists():
+        return
+    try:
+        for line in env_file.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k = k.strip()
+            v = v.strip().strip('"').strip("'")
+            if k and k not in os.environ:
+                os.environ[k] = v
+    except Exception as e:
+        print(f"[boot] aviso: falha lendo {env_file}: {e}")
+
+
+_bootstrap_env()
+
+# Agora é seguro importar o resto
 from brn_config import Config
 from brn_logger import setup_logger, get_logger
 from version import VERSION, BUILD_DATE, GITHUB_USER, GITHUB_REPO
@@ -43,9 +70,12 @@ NODE_ID_PATH = BASE_DIR / "node_identity.enc"
 
 CLIENT_BOOT_TIMEOUT = int(os.environ.get("BRN_CLIENT_BOOT_TIMEOUT", "120"))
 
+# Tracking de serviços para shutdown limpo (v10.1)
+_running_services: list = []
+
 
 # ============================================================
-# L2 IMPORTS — com fallback que NUNCA quebra o nó
+# L2 IMPORTS — com fallback que NUNCA quebra o nó (v8.3 mantido)
 # ============================================================
 L2_ENABLED = False
 btc_config = None
@@ -76,10 +106,31 @@ def _l2_disponivel() -> bool:
 
 
 # ============================================================
+# AUDIT LOG (v10.1) — protegido, nunca derruba o nó
+# ============================================================
+def _audit(event: str, data: dict | None = None):
+    """Registra no audit log se security.py estiver disponível."""
+    try:
+        from security import audit_log
+        audit_log(event, data or {})
+    except Exception:
+        pass
+
+
+def _close_audit():
+    try:
+        from security import close_audit
+        close_audit()
+    except Exception:
+        pass
+
+
+# ============================================================
 # ARGUMENTOS
 # ============================================================
 def parse_args():
-    p = argparse.ArgumentParser(prog="main.py", description="BRN Node v8.3")
+    p = argparse.ArgumentParser(prog="main.py", description="BRN Node v10.1")
+    # --- diagnósticos (v8.3) ---
     p.add_argument("--status", action="store_true")
     p.add_argument("--headless", action="store_true")
     p.add_argument("--read-only", action="store_true")
@@ -93,9 +144,16 @@ def parse_args():
     p.add_argument("--rotate-node-id", action="store_true")
     p.add_argument("--client-mode", action="store_true")
     p.add_argument("--discover", action="store_true")
+    # --- L2 (v8.1) ---
     p.add_argument("--l2", action="store_true", help="Ativa watcher BTC->BRN (RPC-only)")
     p.add_argument("--mine", action="store_true", help="Ativa mineracao (prioriza L2)")
     p.add_argument("--l2-stats", action="store_true", help="Mostra stats L2 e sai")
+    # --- segurança (v10.1) ---
+    p.add_argument("--no-p2p", action="store_true", help="Desabilita rede P2P")
+    p.add_argument("--verify-only", action="store_true",
+                   help="Só verifica a cadeia e sai")
+    p.add_argument("--skip-verify", action="store_true",
+                   help="Pula verificação de integridade no boot")
     return p.parse_args()
 
 
@@ -144,7 +202,90 @@ def load_or_create_node_identity(password: str, rotate: bool = False):
 
 
 # ============================================================
-# VERSION / DIAGNOSTICO
+# AUTO-DETECÇÃO DE PAPEL (v10.1)
+# ============================================================
+def _read_role() -> str:
+    """Lê brn_role.txt. Retorna 'origin', 'client' ou 'auto'."""
+    try:
+        p = BASE_DIR / "brn_role.txt"
+        if p.exists():
+            return p.read_text(encoding="utf-8").strip().lower()
+    except Exception:
+        pass
+    return "auto"
+
+
+def _is_origin(client_mode: bool) -> bool:
+    """
+    Decide se este nó é o nó-origem (assina checkpoints).
+    Prioridade:
+      1. --client-mode força cliente
+      2. Env BRN_IS_ORIGIN=1 força origem
+      3. brn_role.txt == 'origin'/'hub'/'servidor'
+      4. Autodetecção: se não há bootstrap_peers, é o hub
+    """
+    if client_mode:
+        return False
+    if os.environ.get("BRN_IS_ORIGIN", "0") == "1":
+        return True
+
+    role = _read_role()
+    if role in ("origin", "hub", "servidor"):
+        return True
+    if role in ("cliente", "client"):
+        return False
+
+    # Autodetecção: se não há peers bootstrap, provavelmente é o hub
+    try:
+        bp = BASE_DIR / "bootstrap_peers.json"
+        if bp.exists():
+            peers = json.loads(bp.read_text(encoding="utf-8")) or []
+            if len(peers) > 0:
+                return False
+    except Exception:
+        pass
+    return True
+
+
+# ============================================================
+# VERIFICAÇÃO DE INTEGRIDADE (v10.1)
+# ============================================================
+def _verify_chain_or_die(chain, strict: bool = False):
+    """Roda chain_validator.py. Se strict=True e cadeia inválida, sai."""
+    try:
+        from chain_validator import verify_chain
+    except ImportError:
+        get_logger("verify").info("chain_validator.py nao disponivel")
+        return True
+
+    log = get_logger("verify")
+    log.info("Verificando integridade da cadeia...")
+    t0 = time.time()
+    try:
+        r = verify_chain(chain)
+    except Exception as e:
+        log.error(f"Exceção ao verificar: {e}")
+        return True  # não aborta por falha do validador
+
+    dt = time.time() - t0
+    if r.valid:
+        log.info(f"✓ {r.summary()} ({dt:.2f}s, "
+                 f"{r.blocks_checked} blocos, "
+                 f"{r.checkpoints_checked} checkpoints)")
+        for w in (r.warnings or [])[:5]:
+            log.warning(f"  {w}")
+        return True
+    else:
+        log.error(f"✗ CADEIA INVALIDA ({len(r.errors)} erros)")
+        for e in (r.errors or [])[:10]:
+            log.error(f"  - {e}")
+        if strict:
+            return False
+    return r.valid
+
+
+# ============================================================
+# VERSION / DIAGNOSTICO (v8.3 mantido)
 # ============================================================
 def _parse_version(s):
     try:
@@ -178,6 +319,13 @@ def do_status(cfg):
     print(f" P2P    : {cfg['p2p_port']}")
     print()
 
+    # HTTPS status (v10.1)
+    https = os.environ.get("BRN_HTTPS", "0") == "1"
+    audit = os.environ.get("BRN_AUDIT_ENABLED", "1") == "1"
+    print(f" HTTPS      : {'SIM' if https else 'nao'}")
+    print(f" Audit log  : {'SIM' if audit else 'nao'} ({os.environ.get('BRN_AUDIT_LOG','audit.log')})")
+    print()
+
     # L2 status (protegido)
     if _l2_disponivel():
         try:
@@ -199,6 +347,9 @@ def do_status(cfg):
             print(f"   Alturas   : {alturas[:5]}{'...' if len(alturas) > 5 else ''}")
     except Exception as e:
         print(f" Checkpoints: indisponivel ({e})")
+
+    # Role status
+    print(f" Role (auto): {'ORIGEM' if _is_origin(False) else 'CLIENTE'}")
 
     db_path = cfg["db_path"]
     print(f" DB path : {db_path}")
@@ -261,8 +412,23 @@ def run_http():
     from server import app as http_app
     log = get_logger("http")
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    log.info(f"HTTP http://0.0.0.0:{port}")
-    http_app.run(host="0.0.0.0", port=port, threaded=True, debug=False, use_reloader=False)
+
+    # v10.1: HTTPS se BRN_HTTPS=1
+    ssl_ctx = None
+    if os.environ.get("BRN_HTTPS", "0") == "1":
+        try:
+            from security import ensure_self_signed_cert
+            cert, key = ensure_self_signed_cert()
+            ssl_ctx = (cert, key)
+            log.info(f"HTTPS https://0.0.0.0:{port}")
+        except Exception as e:
+            log.warning(f"Falha ao gerar cert HTTPS: {e}. Caindo para HTTP.")
+            ssl_ctx = None
+    if ssl_ctx is None:
+        log.info(f"HTTP http://0.0.0.0:{port}")
+
+    http_app.run(host="0.0.0.0", port=port, threaded=True, debug=False,
+                 use_reloader=False, ssl_context=ssl_ctx)
 
 
 def run_explorer():
@@ -323,6 +489,34 @@ def run_wallet_main_thread():
 
 
 # ============================================================
+# SHUTDOWN LIMPO (v10.1)
+# ============================================================
+def _graceful_shutdown(log):
+    log.info("Encerrando serviços...")
+
+    # Serviços registrados (P2P, miners, etc.)
+    for svc in _running_services:
+        try:
+            if hasattr(svc, "stop"):
+                svc.stop()
+            elif callable(svc):
+                svc()
+        except Exception as e:
+            log.warning(f"Falha parando serviço: {e}")
+
+    # Tranca a sessão da carteira
+    try:
+        from wallet import WalletManager
+        WalletManager.lock_session()
+    except Exception:
+        pass
+
+    # Registra e fecha audit log
+    _audit("node_stop", {})
+    _close_audit()
+
+
+# ============================================================
 # MAIN
 # ============================================================
 def main():
@@ -341,14 +535,18 @@ def main():
 
     log = setup_logger(level=cfg["log_level"], log_file=cfg["log_file"] or None)
 
+    # ---------- Resumo do boot ----------
+    is_origin = _is_origin(args.client_mode)
     log.info("=" * 60)
-    log.info(f" BRN Node v{VERSION} ({BUILD_DATE}) + L2 MINERADO + Checkpoints")
+    log.info(f" BRN Node v{VERSION} ({BUILD_DATE}) + L2 + Checkpoints + Security")
     l2_mode = "ON" if (args.l2 and _l2_disponivel()) else (
               "off" if not args.l2 else "INDISPONIVEL")
-    log.info(f" Config: {cfg.source} | Modo: {'CLIENTE' if args.client_mode else 'ORIGEM'} | L2: {l2_mode}")
+    log.info(f" Config: {cfg.source} | Modo: {'CLIENTE' if args.client_mode else ('ORIGEM' if is_origin else 'HUB')} | L2: {l2_mode}")
+    log.info(f" HTTPS: {'ON' if os.environ.get('BRN_HTTPS')=='1' else 'off'} | "
+             f"Audit: {'ON' if os.environ.get('BRN_AUDIT_ENABLED','1')=='1' else 'off'}")
     log.info("=" * 60)
 
-    # --- comandos de diagnostico que saem sozinhos ---
+    # ---------- Comandos que saem sozinhos ----------
     if args.version:
         print(VERSION)
         return
@@ -378,7 +576,7 @@ def main():
         print(check_for_update())
         return
 
-    # --- identidade ---
+    # ---------- Identidade ----------
     node_password = _resolve_password(args)
     try:
         node_id_priv, node_id_pub = load_or_create_node_identity(
@@ -391,36 +589,53 @@ def main():
             pass
     log.info(f"No ID: {node_id_pub}")
 
-    # --- blockchain + P2P ---
+    # ---------- Blockchain + P2P ----------
     from blockchain import Blockchain
-    from p2p_unified import P2PManager
-
     chain = Blockchain(cfg["db_path"], auto_genesis=not args.client_mode)
     log.info(f"Altura atual: {chain.db.height()}")
 
-    # ============================================================
-    # v9.1.4: Carrega checkpoints assinados
-    # ============================================================
+    # ---------- CHECKPOINTS (v9.1.4) ----------
     try:
         from checkpoints import load_checkpoints
         from blockchain import set_checkpoints, set_checkpoint_priv
         cps = load_checkpoints()
         set_checkpoints(cps)
-        # Só o nó-origem assina novos checkpoints
-        if not args.client_mode and node_id_priv is not None:
+        if is_origin and node_id_priv is not None:
             set_checkpoint_priv(node_id_priv)
-        log.info(
-            f"Checkpoints: {len(cps)} carregados"
-            + (" (assinatura ATIVA)" if not args.client_mode else "")
-        )
+            log.info(f"Checkpoints: {len(cps)} carregados (assinatura ATIVA)")
+        else:
+            log.info(f"Checkpoints: {len(cps)} carregados (só valida)")
     except Exception as e:
         log.warning(f"Checkpoints desativados: {e}")
 
-    p2p = P2PManager(chain, node_id_priv,
-                     tcp_port=cfg["p2p_port"], enable_upnp=cfg["upnp"])
-    p2p.start()
+    # ---------- VERIFICAÇÃO DE INTEGRIDADE (v10.1) ----------
+    if args.verify_only:
+        ok = _verify_chain_or_die(chain, strict=True)
+        try: chain.db.close()
+        except Exception: pass
+        return 0 if ok else 2
 
-    # --- L2 (com fallback completo) ---
+    if not args.skip_verify and os.environ.get("BRN_SKIP_VERIFY", "0") != "1":
+        strict = os.environ.get("BRN_VERIFY_STRICT", "0") == "1"
+        ok = _verify_chain_or_die(chain, strict=strict)
+        if not ok and strict:
+            log.error("Abortando boot: cadeia invalida (BRN_VERIFY_STRICT=1)")
+            sys.exit(2)
+
+    # ---------- P2P ----------
+    p2p = None
+    if not args.no_p2p:
+        try:
+            from p2p_unified import P2PManager
+            p2p = P2PManager(chain, node_id_priv,
+                             tcp_port=cfg["p2p_port"], enable_upnp=cfg["upnp"])
+            p2p.start()
+            _running_services.append(p2p)
+            log.info("P2P iniciado")
+        except Exception as e:
+            log.error(f"Falha ao iniciar P2P: {e}")
+
+    # ---------- L2 (com fallback completo) ----------
     l2_manager = None
     btc_watcher = None
     l2_ativo = False
@@ -448,16 +663,17 @@ def main():
                 else:
                     btc_watcher = BTCWatcher(chain.db, chain)
                     btc_watcher.start()
+                    _running_services.append(btc_watcher)
                     log.info(f"L2 Watcher RPC iniciado em {btc_addr}")
             except Exception as _e:
                 log.warning(f"Falha ao iniciar BTCWatcher: {_e} - continuando sem L2")
                 btc_watcher = None
 
-    # --- HTTP + Explorer ---
+    # ---------- HTTP + Explorer ----------
     threading.Thread(target=run_http,     daemon=True, name="HTTP").start()
     threading.Thread(target=run_explorer, daemon=True, name="Explorer").start()
 
-    # --- miner ---
+    # ---------- Miner CLI ----------
     if chain.db.height() >= 0:
         try:
             from miner_loop import get_miner
@@ -480,11 +696,22 @@ def main():
         except Exception as e:
             log.error(f"Miner erro: {e}")
 
-    # --- status loop ---
+    # ---------- Status loop ----------
     threading.Thread(
         target=run_status_loop, args=(chain, p2p, l2_manager),
         daemon=True, name="StatusLoop",
     ).start()
+
+    # ---------- AUDIT: boot registrado (v10.1) ----------
+    _audit("node_start", {
+        "mode":    "client" if args.client_mode else ("origin" if is_origin else "hub"),
+        "l2":      bool(args.l2 and l2_ativo),
+        "mine":    bool(args.mine),
+        "https":   os.environ.get("BRN_HTTPS") == "1",
+        "height":  chain.db.height(),
+        "tip":     chain.db.tip_hash()[:16],
+        "node_id": node_id_pub[:16],
+    })
 
     log.info("No pronto. Ctrl+C para encerrar.")
     if args.l2 and l2_ativo:
@@ -492,7 +719,7 @@ def main():
     elif args.l2:
         log.info("L2 PEDIDO mas INDISPONIVEL - no rodando sem bridge BTC")
 
-    # --- cliente aguarda genesis ---
+    # ---------- Cliente aguarda genesis ----------
     if args.client_mode and chain.db.height() < 0:
         log.info(f"Aguardando genesis (timeout {CLIENT_BOOT_TIMEOUT}s)...")
         t0 = time.time()
@@ -501,7 +728,7 @@ def main():
                 break
             time.sleep(1)
 
-    # --- UI / loop principal ---
+    # ---------- UI / loop principal ----------
     use_wallet = not cfg["headless"]
     if use_wallet:
         try:
@@ -515,25 +742,17 @@ def main():
         except KeyboardInterrupt:
             pass
 
-    # --- shutdown ---
+    # ---------- Shutdown ----------
     log.info("Encerrando...")
     _shutdown.set()
-
-    try:
-        if btc_watcher is not None:
-            btc_watcher.stop()
-    except Exception as _e:
-        log.warning(f"Erro ao parar btc_watcher: {_e}")
-
-    try:
-        p2p.stop()
-    except Exception:
-        pass
+    _graceful_shutdown(log)
 
     try:
         chain.db.close()
     except Exception:
         pass
+
+    return 0
 
 
 def _on_signal(signum, frame):
@@ -543,4 +762,11 @@ def _on_signal(signum, frame):
 if __name__ == "__main__":
     signal.signal(signal.SIGINT,  _on_signal)
     signal.signal(signal.SIGTERM, _on_signal)
-    main()
+    try:
+        sys.exit(main())
+    except Exception as e:
+        try:
+            get_logger("main").exception(f"Erro fatal: {e}")
+        except Exception:
+            print(f"Erro fatal: {e}", file=sys.stderr)
+        sys.exit(1)
