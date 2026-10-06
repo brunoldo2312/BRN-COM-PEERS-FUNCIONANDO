@@ -1,9 +1,10 @@
 """
-p2p_auth.py — Autenticacao Ed25519 para handshake P2P do BRN.
+p2p_auth.py — Autenticacao Ed25519 para handshake P2P do BRN (v2).
 
 Nivel 2: cada mensagem P2P carrega um bloco "_auth" com a assinatura
-Ed25519 do remetente sobre (domain || pub || nonce || ts).
-NAO criptografa o trafego. So prova posse da chave privada.
+Ed25519 do remetente sobre (domain || pub || nonce || ts || msg_hash).
+NAO criptografa o trafego. So prova posse da chave privada E amarra
+a assinatura ao payload, impedindo replay e payload swap.
 
 Modos (env BRN_P2P_AUTH):
   off       - desabilitado (nao valida nada)
@@ -16,10 +17,23 @@ Allowlist (env BRN_P2P_ALLOWLIST):
 
 Janela (env BRN_P2P_AUTH_WINDOW):
   segundos de tolerancia no timestamp (padrao: 30)
+
+Cache de nonces (env BRN_P2P_NONCE_CACHE):
+  numero maximo de nonces lembrados (padrao: 10000). Anti-replay.
+
+v2 (SEGURANÇA):
+  + [CRITICO] Anti-replay via cache LRU de nonces (nao aceita repetido)
+  + [CRITICO] Binding criptografico ao payload (msg_hash na assinatura)
+  + [NOVO]    Funcao _msg_hash deterministica (ordena chaves, remove _auth)
+  + [NOVO]    reset_nonce_cache() para testes
 """
 import os
 import time
+import json
+import hashlib
 import secrets
+import threading
+from collections import OrderedDict
 
 # ------------------------------------------------------------------
 # CONFIG
@@ -27,6 +41,7 @@ import secrets
 AUTH_MODE = os.environ.get("BRN_P2P_AUTH", "optional").lower()
 ALLOWLIST_RAW = os.environ.get("BRN_P2P_ALLOWLIST", "").strip()
 AUTH_WINDOW = int(os.environ.get("BRN_P2P_AUTH_WINDOW", "30"))
+NONCE_CACHE_SIZE = int(os.environ.get("BRN_P2P_NONCE_CACHE", "10000"))
 
 ALLOWLIST = set()
 for x in ALLOWLIST_RAW.split(","):
@@ -34,7 +49,7 @@ for x in ALLOWLIST_RAW.split(","):
     if x:
         ALLOWLIST.add(x)
 
-DOMAIN = b"BRN-AUTH-v1|"
+DOMAIN = b"BRN-AUTH-v2|"
 
 # Global: setado uma vez pelo P2PManager
 _NODE_ID_PRIV = None
@@ -61,12 +76,74 @@ def auth_required() -> bool:
     return AUTH_MODE == "required"
 
 
-def _payload(pub_hex: str, nonce_hex: str, ts: int) -> bytes:
-    return DOMAIN + f"{pub_hex}|{nonce_hex}|{ts}".encode()
+def _payload(pub_hex: str, nonce_hex: str, ts: int, msg_hash_hex: str = "") -> bytes:
+    """
+    Bytes que sao realmente assinados.
+    Se msg_hash_hex for fornecido, amarra a assinatura ao payload.
+    """
+    base = DOMAIN + f"{pub_hex}|{nonce_hex}|{ts}".encode()
+    if msg_hash_hex:
+        base += b"|" + msg_hash_hex.encode()
+    return base
 
 
-def build_auth(node_id_priv=None) -> dict:
-    """Cria bloco _auth assinado pela chave privada Ed25519."""
+def _msg_hash(msg) -> str:
+    """
+    SHA256 deterministico do payload.
+    - Remove _auth (nao pode se auto-assinar)
+    - Remove _port (metadado de rede, nao faz parte da semantica)
+    - Ordena chaves (sort_keys=True)
+    """
+    if msg is None:
+        return ""
+    try:
+        payload = {k: v for k, v in msg.items() if k not in ("_auth", "_port")}
+        canonical = json.dumps(
+            payload, separators=(",", ":"), sort_keys=True, default=str
+        ).encode()
+        return hashlib.sha256(canonical).hexdigest()
+    except Exception:
+        return ""
+
+
+# ------------------------------------------------------------------
+# CACHE DE NONCES (anti-replay)
+# ------------------------------------------------------------------
+_nonce_lock = threading.Lock()
+_seen_nonces = OrderedDict()
+
+
+def _check_nonce(nonce_hex: str) -> bool:
+    """
+    True se o nonce e novo. False se ja foi visto (replay).
+    Mantem um cache LRU limitado por NONCE_CACHE_SIZE.
+    """
+    with _nonce_lock:
+        if nonce_hex in _seen_nonces:
+            # Renova posicao (uso recente)
+            _seen_nonces.move_to_end(nonce_hex)
+            return False
+        _seen_nonces[nonce_hex] = time.time()
+        # Poda os mais antigos se exceder o limite
+        while len(_seen_nonces) > NONCE_CACHE_SIZE:
+            _seen_nonces.popitem(last=False)
+        return True
+
+
+def reset_nonce_cache():
+    """Limpa o cache de nonces. Util para testes."""
+    with _nonce_lock:
+        _seen_nonces.clear()
+
+
+# ------------------------------------------------------------------
+# BUILD
+# ------------------------------------------------------------------
+def build_auth(node_id_priv=None, msg=None) -> dict:
+    """
+    Cria bloco _auth assinado pela chave privada Ed25519.
+    Se `msg` for passado, a assinatura fica amarrada ao payload.
+    """
     if node_id_priv is None:
         node_id_priv = _NODE_ID_PRIV
     if node_id_priv is None:
@@ -75,12 +152,25 @@ def build_auth(node_id_priv=None) -> dict:
     pub_hex = node_id_priv.public_key().public_bytes_raw().hex()
     nonce = secrets.token_bytes(32).hex()
     ts = int(time.time())
-    sig = node_id_priv.sign(_payload(pub_hex, nonce, ts)).hex()
-    return {"pub": pub_hex, "nonce": nonce, "ts": ts, "sig": sig}
+    mh = _msg_hash(msg)
+    sig = node_id_priv.sign(_payload(pub_hex, nonce, ts, mh)).hex()
+
+    out = {"pub": pub_hex, "nonce": nonce, "ts": ts, "sig": sig}
+    if mh:
+        out["msg_hash"] = mh
+    return out
 
 
-def verify_auth(auth: dict, allowlist=None) -> tuple:
-    """Verifica um bloco _auth. Retorna (ok, motivo)."""
+# ------------------------------------------------------------------
+# VERIFY
+# ------------------------------------------------------------------
+def verify_auth(auth: dict, allowlist=None, msg=None) -> tuple:
+    """
+    Verifica um bloco _auth. Retorna (ok, motivo).
+
+    Se `msg` for passado, exige binding criptografico ao payload.
+    Sempre valida anti-replay (nonce unico) e janela de timestamp.
+    """
     if not isinstance(auth, dict):
         return False, "auth nao e dict"
 
@@ -114,15 +204,51 @@ def verify_auth(auth: dict, allowlist=None) -> tuple:
     if len(sig_bytes) != 64:
         return False, "assinatura deve ter 64 bytes"
 
+    # --- Allowlist ---
     al = ALLOWLIST if allowlist is None else allowlist
     if al and pub_hex not in al:
         return False, "pubkey nao esta na allowlist"
 
+    # --- Anti-replay: nonce unico ---
+    if not _check_nonce(nonce_hex):
+        return False, "nonce ja visto (replay)"
+
+    # --- Binding ao payload ---
+    mh = ""
+    if msg is not None:
+        mh = _msg_hash(msg)
+        expected_mh = str(auth.get("msg_hash", ""))
+        if not mh:
+            # Nao consegui hashear o payload -> rejeita por seguranca
+            return False, "falha ao hashear payload"
+        if expected_mh != mh:
+            return False, "msg_hash nao corresponde ao payload"
+
+    # --- Assinatura Ed25519 ---
     try:
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
         pk = Ed25519PublicKey.from_public_bytes(pub_bytes)
-        pk.verify(sig_bytes, _payload(pub_hex, nonce_hex, ts))
+        pk.verify(sig_bytes, _payload(pub_hex, nonce_hex, ts, mh))
     except Exception:
         return False, "assinatura Ed25519 invalida"
 
     return True, ""
+
+
+# ------------------------------------------------------------------
+# DIAGNOSTICO
+# ------------------------------------------------------------------
+def stats() -> dict:
+    """Retorna estatisticas para debug."""
+    with _nonce_lock:
+        nonces = len(_seen_nonces)
+    return {
+        "mode":             AUTH_MODE,
+        "window_s":         AUTH_WINDOW,
+        "nonce_cache_size": NONCE_CACHE_SIZE,
+        "nonces_cached":    nonces,
+        "allowlist_active": bool(ALLOWLIST),
+        "allowlist_count":  len(ALLOWLIST),
+        "node_pub":         (_NODE_ID_PRIV.public_key().public_bytes_raw().hex()[:16] + "...")
+                            if _NODE_ID_PRIV else "(nao setada)",
+    }
