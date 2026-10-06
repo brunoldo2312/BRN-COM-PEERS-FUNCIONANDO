@@ -1,7 +1,14 @@
 """
-p2p_unified.py — BRN P2P Network v6.3
+p2p_unified.py — BRN P2P Network v6.4
 ============================================================
-Novidades v6.3:
+Novidades v6.4:
+  + [SEGURANÇA] Binding criptografico ao payload:
+    - build_auth agora recebe `msg` e assina o msg_hash
+    - verify_auth agora valida que msg_hash bate com o payload
+    - Bloqueia ataque de payload swap (MITM trocando msg mantendo _auth)
+  + [SEGURANÇA] Anti-replay automatico (via p2p_auth v2)
+
+Herdado da v6.3:
   + PATCH: registra peers no banco SQLite (para a carteira
     enxergar Peers > 0)
 
@@ -244,6 +251,8 @@ class Metrics:
             "last_sync_height": 0,
             "auth_ok": 0,
             "auth_failed": 0,
+            "auth_replay_blocked": 0,   # [v6.4] contador dedicado
+            "auth_payload_swap_blocked": 0,  # [v6.4]
         }
         self.peer_metrics = defaultdict(lambda: {
             "last_seen": 0,
@@ -614,13 +623,22 @@ class P2PServer(threading.Thread):
             # PATCH v6.3: registra peer no DB (aceita conexao de entrada)
             _registrar_peer_no_db(self.bc, peer_ip, msg.get("_port", 6001))
 
+            # ============================================================
+            # v6.4: Autenticacao com binding ao payload
+            # ============================================================
             _auth = msg.pop("_auth", None)
             if auth_enabled():
                 if _auth:
-                    ok, err = verify_auth(_auth)
+                    # [v6.4] Passa msg SEM o _auth (ja foi popado) para validar binding
+                    ok, err = verify_auth(_auth, msg=msg)
                     if not ok:
                         print(f"[Auth] {peer_ip}: REJEITADO - {err}")
                         self.metrics.inc("auth_failed")
+                        # Contadores dedicados por tipo de ataque
+                        if "replay" in err:
+                            self.metrics.inc("auth_replay_blocked")
+                        if "msg_hash" in err or "payload" in err:
+                            self.metrics.inc("auth_payload_swap_blocked")
                         return
                     print(f"[Auth] {peer_ip}: OK pub={_auth['pub'][:16]}...")
                     self.metrics.inc("auth_ok")
@@ -633,9 +651,14 @@ class P2PServer(threading.Thread):
 
             response = self._process_message(msg, addr)
             if response:
+                # ============================================================
+                # v6.4: Assina a resposta COM binding
+                # ============================================================
                 if auth_enabled():
                     try:
-                        response["_auth"] = build_auth()
+                        # Passa copia sem _auth para build_auth (evita recursao)
+                        response_sem_auth = {k: v for k, v in response.items() if k != "_auth"}
+                        response["_auth"] = build_auth(msg=response_sem_auth)
                     except Exception as e:
                         print(f"[Auth] falha ao assinar resposta: {e}")
 
@@ -710,7 +733,7 @@ class P2PServer(threading.Thread):
 
 
 # ============================================================
-# CLIENTE TCP (com recv corrigido)
+# CLIENTE TCP
 # ============================================================
 class P2PClient:
     @staticmethod
@@ -724,10 +747,15 @@ class P2PClient:
             t0 = time.time()
             s.connect((ip, port))
 
+            # ============================================================
+            # v6.4: Assina o request COM binding ao payload
+            # ============================================================
             if auth_enabled():
                 try:
                     message = dict(message)
-                    message["_auth"] = build_auth()
+                    # [v6.4] Passa msg sem _auth (ainda nao tem)
+                    message_sem_auth = {k: v for k, v in message.items() if k != "_auth"}
+                    message["_auth"] = build_auth(msg=message_sem_auth)
                 except Exception as e:
                     print(f"[Auth] falha ao assinar request: {e}")
 
@@ -758,10 +786,14 @@ class P2PClient:
             if raw.startswith(NETWORK_MAGIC):
                 resp = json.loads(raw[len(NETWORK_MAGIC):].decode())
 
+                # ============================================================
+                # v6.4: Verifica resposta COM binding ao payload
+                # ============================================================
                 if auth_enabled():
                     _rauth = resp.pop("_auth", None)
                     if _rauth:
-                        ok, err = verify_auth(_rauth)
+                        # [v6.4] resp agora nao tem _auth; valida binding
+                        ok, err = verify_auth(_rauth, msg=resp)
                         if not ok:
                             print(f"[Auth] resposta de {ip} REJEITADA - {err}")
                             return None, latency_ms
