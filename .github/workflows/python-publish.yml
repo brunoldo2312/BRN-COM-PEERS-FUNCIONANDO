@@ -1,0 +1,145 @@
+# .github/workflows/python-publish.yml
+# Build + Release do nó BRN
+# - Roda em cada release publicado
+# - Também pode ser disparado manualmente (workflow_dispatch)
+# - Valida sintaxe de todos os .py
+# - Verifica dependências obrigatórias
+# - Empacota em .tar.gz e .zip
+# - Anexa os arquivos ao release do GitHub
+
+name: Build & Release BRN Node
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Versão (ex: v11.0.0)'
+        required: false
+        default: 'dev'
+
+permissions:
+  contents: write   # necessário para anexar arquivos ao release
+
+jobs:
+  build:
+    name: Build & package
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+
+      - name: Syntax check (py_compile)
+        run: |
+          python -m compileall -q . -x 'venv|\.venv|__pycache__|\.git'
+
+      - name: Dependency check
+        env:
+          BRN_NETWORK_SECRET: ci-test-secret-not-used-in-prod
+        run: |
+          if [ -f check_deps.py ]; then
+            python check_deps.py || echo "check_deps avisou problemas (não bloqueia)"
+          fi
+
+      - name: Determinar versão
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            echo "version=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Preparar pacote
+        run: |
+          mkdir -p dist/brn-node
+          rsync -a \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='__pycache__' \
+            --exclude='*.pyc' \
+            --exclude='venv' \
+            --exclude='.venv' \
+            --exclude='env' \
+            --exclude='*.db' \
+            --exclude='*.db-wal' \
+            --exclude='*.db-shm' \
+            --exclude='*.log' \
+            --exclude='node_identity.enc' \
+            --exclude='node_identity.enc.bak' \
+            --exclude='wallet_encrypted.dat' \
+            --exclude='miner_wallet.enc' \
+            --exclude='audit.log*' \
+            --exclude='brn_cert.pem' \
+            --exclude='brn_key.pem' \
+            --exclude='dist' \
+            ./ dist/brn-node/
+
+          # Garante que os arquivos essenciais estão no pacote
+          test -f dist/brn-node/main.py || (echo "FALTA main.py" && exit 1)
+          test -f dist/brn-node/requirements.txt || (echo "FALTA requirements.txt" && exit 1)
+
+          # Cria um README rápido de instalação dentro do pacote
+          cat > dist/brn-node/COMO_RODAR.txt <<'EOF'
+          BRN Node — Instalação rápida
+          ============================
+
+          1. Instale dependências:
+             pip install -r requirements.txt
+
+          2. Defina as 2 variáveis obrigatórias:
+             export BRN_NETWORK_SECRET="sua-frase-secreta-longa-e-unica"
+             export BRN_NODE_PASSWORD="senha-forte-do-no"
+
+          3. Verifique dependências:
+             python check_deps.py
+
+          4. Rode em modo diagnóstico:
+             python main.py --status
+
+          5. Suba o nó:
+             python main.py
+
+          Mais info: leia o README.md
+          EOF
+
+          cd dist
+          VERSION="${{ steps.ver.outputs.version }}"
+          tar -czf "brn-node-${VERSION}.tar.gz" brn-node/
+          zip -r "brn-node-${VERSION}.zip" brn-node/
+          ls -la
+
+      - name: Upload artifact (sempre)
+        uses: actions/upload-artifact@v4
+        with:
+          name: brn-node-${{ steps.ver.outputs.version }}
+          path: |
+            dist/brn-node-*.tar.gz
+            dist/brn-node-*.zip
+          retention-days: 30
+
+      - name: Anexar ao release (somente em release)
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/brn-node-${{ steps.ver.outputs.version }}.tar.gz
+            dist/brn-node-${{ steps.ver.outputs.version }}.zip
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
