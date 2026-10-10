@@ -1,14 +1,9 @@
-"""db.py — Banco SQLite do BRN (v6.2)
-v4: + delete_blocks_above, + get_blocks_range, + peer score
-v5: + get_next_nonce, + get_nonce_for_pubkey (proteção replay)
-v6: + contratos inteligentes + L2 (BTC->BRN)
-v6.1:
-  + transactions.raw BLOB (migração automática)
-  + remover_peer_por_pubkey()
-  + get_tx_by_txid() O(1)
+"""db.py — Banco SQLite do BRN (v6.3)
 v6.2:
   + backfill automático de transactions.raw no __init__ (idempotente)
-  + pode ser desabilitado com BRN_SKIP_RAW_BACKFILL=1
+v6.3:
+  [FIX] contract_spend — corrigida corrupção de sintaxe (ois/dissoco)
+  [NEW] get_tx_block_height(txid) — usado por Blockchain.count_confirmations
 """
 import os
 import time
@@ -30,7 +25,6 @@ class ChainDB:
                   "PRAGMA mmap_size=268435456", "PRAGMA foreign_keys=ON"):
             self.conn.execute(p)
         self._schema()
-        # [v6.2] migração automática — roda uma vez, idempotente
         self._migrate_raw_txs()
 
     def _schema(self):
@@ -92,72 +86,52 @@ class ChainDB:
             CREATE INDEX IF NOT EXISTS idx_events_ts ON network_events(timestamp DESC);
 
             CREATE TABLE IF NOT EXISTS contracts (
-                contract_id TEXT PRIMARY KEY,
-                owner TEXT NOT NULL,
-                code TEXT NOT NULL,
-                metadata TEXT,
-                created_at INTEGER NOT NULL
+                contract_id TEXT PRIMARY KEY, owner TEXT NOT NULL,
+                code TEXT NOT NULL, metadata TEXT, created_at INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_contracts_owner ON contracts(owner);
             CREATE INDEX IF NOT EXISTS idx_contracts_created ON contracts(created_at DESC);
 
             CREATE TABLE IF NOT EXISTS contract_state (
-                contract_id TEXT PRIMARY KEY,
-                state TEXT NOT NULL,
+                contract_id TEXT PRIMARY KEY, state TEXT NOT NULL,
                 updated_at INTEGER NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS contract_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                contract_id TEXT NOT NULL,
-                event TEXT NOT NULL,
-                data TEXT,
-                timestamp INTEGER NOT NULL
+                contract_id TEXT NOT NULL, event TEXT NOT NULL,
+                data TEXT, timestamp INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_contract_events_id
                 ON contract_events(contract_id, timestamp DESC);
 
             CREATE TABLE IF NOT EXISTS l2_escrows (
-                escrow_id TEXT PRIMARY KEY,
-                creator TEXT,
-                buyer TEXT,
-                brn_amount INTEGER,
-                btc_expected_sats INTEGER,
-                btc_address TEXT,
-                btc_txid TEXT,
-                status TEXT,
-                created_at INTEGER,
-                expires_at INTEGER,
-                l2_hash TEXT,
+                escrow_id TEXT PRIMARY KEY, creator TEXT, buyer TEXT,
+                brn_amount INTEGER, btc_expected_sats INTEGER,
+                btc_address TEXT, btc_txid TEXT, status TEXT,
+                created_at INTEGER, expires_at INTEGER, l2_hash TEXT,
                 raw_json TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_l2_status ON l2_escrows(status);
             CREATE INDEX IF NOT EXISTS idx_l2_buyer ON l2_escrows(buyer);
 
             CREATE TABLE IF NOT EXISTS btc_used (
-                btc_txid TEXT PRIMARY KEY,
-                escrow_id TEXT,
-                used_at INTEGER
+                btc_txid TEXT PRIMARY KEY, escrow_id TEXT, used_at INTEGER
             );
 
             CREATE TABLE IF NOT EXISTS l2_blocks (
-                merkle_root TEXT PRIMARY KEY,
-                timestamp INTEGER,
-                count INTEGER,
-                raw_json TEXT
+                merkle_root TEXT PRIMARY KEY, timestamp INTEGER,
+                count INTEGER, raw_json TEXT
             );
 
             CREATE TABLE IF NOT EXISTS l2_txs (
-                txid TEXT PRIMARY KEY,
-                type TEXT,
-                escrow_id TEXT,
-                raw_json TEXT,
-                timestamp INTEGER
+                txid TEXT PRIMARY KEY, type TEXT, escrow_id TEXT,
+                raw_json TEXT, timestamp INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_l2tx_escrow ON l2_txs(escrow_id);
             """)
 
-            # --- migrações incrementais de colunas ---
+            # migrações incrementais
             try:
                 cols = self.conn.execute("PRAGMA table_info(peers)").fetchall()
                 names = {c["name"] for c in cols}
@@ -179,21 +153,10 @@ class ChainDB:
             except Exception:
                 pass
 
-    # ==================== [v6.2] BACKFILL AUTOMÁTICO ====================
+    # ==================== BACKFILL AUTOMÁTICO ====================
     def _migrate_raw_txs(self):
-        """
-        Preenche `transactions.raw` para blocos antigos que só tinham
-        (txid, block_height). Roda uma vez por DB — idempotente.
-
-        Fast path: se não há NULLs, retorna em microssegundos.
-
-        Desabilite com:
-            export BRN_SKIP_RAW_BACKFILL=1
-        """
         if os.environ.get("BRN_SKIP_RAW_BACKFILL", "0") == "1":
             return
-
-        # 1) Conta NULLs (fast path)
         try:
             with self.lock:
                 n_null = self.conn.execute(
@@ -202,13 +165,9 @@ class ChainDB:
         except Exception as e:
             print(f"[db] backfill: não consegui contar NULLs: {e}")
             return
-
         if not n_null:
-            return  # DB já migrado ou vazio → nada a fazer
-
+            return
         print(f"[db] backfill: {n_null} tx antigas sem raw — migrando...")
-
-        # 2) Lista heights distintos com NULL
         try:
             with self.lock:
                 rows = self.conn.execute(
@@ -219,21 +178,16 @@ class ChainDB:
         except Exception as e:
             print(f"[db] backfill: falha ao listar heights: {e}")
             return
-
         if not heights:
             return
-
         total = len(heights)
         done = 0
         t0 = time.time()
-
-        # 3) Bloco a bloco, commit por bloco
         for h in heights:
             try:
                 blk = self.get_block(h)
                 if not blk:
                     continue
-
                 with self.lock:
                     self.conn.execute("BEGIN IMMEDIATE TRANSACTION")
                     try:
@@ -250,14 +204,11 @@ class ChainDB:
             except Exception as e:
                 print(f"[db] backfill: bloco {h}: {e}")
                 continue
-
             done += 1
             if done % 500 == 0 or done == total:
                 dt = time.time() - t0
                 rate = done / dt if dt > 0 else 0.0
-                print(f"[db] backfill: {done}/{total} blocos "
-                      f"({rate:.0f} blocos/s)")
-
+                print(f"[db] backfill: {done}/{total} blocos ({rate:.0f} blocos/s)")
         dt = time.time() - t0
         print(f"[db] backfill concluído: {done}/{total} blocos em {dt:.1f}s")
 
@@ -273,14 +224,12 @@ class ChainDB:
                     (block["height"], block["hash"], block["prev_hash"],
                      block["timestamp"], block["nonce"], block["merkle"],
                      block["difficulty"], blob))
-
                 for tx in block["transactions"]:
                     tx_blob = zlib.compress(orjson.dumps(tx), level=6)
                     self.conn.execute(
                         "INSERT OR REPLACE INTO transactions(txid,block_height,raw) "
                         "VALUES (?,?,?)",
                         (tx["txid"], block["height"], tx_blob))
-
                 self.conn.execute("COMMIT")
             except Exception:
                 self.conn.execute("ROLLBACK")
@@ -335,12 +284,8 @@ class ChainDB:
         return [b for b in (self.get_block(h)
                             for h in range(max(0, top - n + 1), top + 1)) if b]
 
-    # ==================== TX LOOKUP O(1) ====================
+    # ==================== TX LOOKUP ====================
     def get_tx_by_txid(self, txid: str):
-        """
-        Retorna (tx_dict, height) ou (None, None).
-        Usa a coluna `transactions.raw` — O(1), sem varrer a cadeia.
-        """
         try:
             row = self.conn.execute(
                 "SELECT raw, block_height FROM transactions WHERE txid = ? LIMIT 1",
@@ -351,6 +296,18 @@ class ChainDB:
             return orjson.loads(zlib.decompress(row["raw"])), row["block_height"]
         except Exception:
             return None, None
+
+    # [v6.3] NOVO — usado por Blockchain.count_confirmations
+    def get_tx_block_height(self, txid: str) -> int:
+        """Retorna o height do bloco onde a tx está, ou -1 se não encontrada."""
+        try:
+            row = self.conn.execute(
+                "SELECT block_height FROM transactions WHERE txid = ? LIMIT 1",
+                (txid,)
+            ).fetchone()
+            return int(row["block_height"]) if row else -1
+        except Exception:
+            return -1
 
     # ==================== UTXO ====================
     def balance(self, address):
@@ -426,7 +383,7 @@ class ChainDB:
                 self.conn.execute("ROLLBACK")
                 raise
 
-    # ==================== NONCE / REPLAY ====================
+    # ==================== NONCE ====================
     def get_next_nonce(self, address: str) -> int:
         row = self.conn.execute(
             "SELECT COUNT(*) AS c FROM utxos WHERE address=? AND spent=1",
@@ -494,7 +451,7 @@ class ChainDB:
         return {"count": row["c"], "sum_fee": row["sf"],
                 "fees": [f["fee"] for f in fees]}
 
-    # ==================== L2 - BTC->BRN ====================
+    # ==================== L2 ====================
     def save_l2_escrow(self, escrow_dict):
         with self.lock:
             self.conn.execute("""
@@ -504,19 +461,12 @@ class ChainDB:
                  l2_hash, raw_json)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                escrow_dict['escrow_id'],
-                escrow_dict['creator'],
-                escrow_dict['buyer'],
-                escrow_dict['brn_amount'],
-                escrow_dict['btc_expected_sats'],
-                escrow_dict['btc_address'],
-                escrow_dict.get('btc_txid'),
-                escrow_dict['status'],
-                escrow_dict['created_at'],
-                escrow_dict['expires_at'],
-                escrow_dict['l2_hash'],
-                json.dumps(escrow_dict)
-            ))
+                escrow_dict['escrow_id'], escrow_dict['creator'],
+                escrow_dict['buyer'], escrow_dict['brn_amount'],
+                escrow_dict['btc_expected_sats'], escrow_dict['btc_address'],
+                escrow_dict.get('btc_txid'), escrow_dict['status'],
+                escrow_dict['created_at'], escrow_dict['expires_at'],
+                escrow_dict['l2_hash'], json.dumps(escrow_dict)))
 
     def get_l2_escrows(self, status=None):
         if status:
@@ -599,7 +549,7 @@ class ChainDB:
             (limit,)).fetchall()
         return [json.loads(r["raw_json"]) for r in rows]
 
-    # ==================== ESTATISTICAS ====================
+    # ==================== ESTATÍSTICAS ====================
     def get_stats(self):
         return {
             "height": self.height(),
@@ -723,7 +673,6 @@ class ChainDB:
             self.conn.execute("DELETE FROM peers WHERE address=?", (address,))
 
     def remover_peer_por_pubkey(self, pubkey: str) -> None:
-        """Remove peer pelo public_key. Usado quando bane por pubkey."""
         if not pubkey:
             return
         with self.lock:
@@ -751,7 +700,7 @@ class ChainDB:
             (n,)).fetchall()
         return [dict(r) for r in rows]
 
-    # ==================== CONTRATOS INTELIGENTES ====================
+    # ==================== CONTRATOS ====================
     def contract_insert(self, contract_id, owner, code, metadata=None):
         with self.lock:
             self.conn.execute(
@@ -844,6 +793,7 @@ class ChainDB:
             (limit,)).fetchall()
         return [dict(r) for r in rows]
 
+    # ==================== [FIX v6.3] contract_spend ====================
     def contract_spend(self, from_addr: str, to_addr: str, amount: int):
         """Move fundos de from_addr para to_addr. Chamado por contracts.py."""
         import hashlib
@@ -886,8 +836,8 @@ class ChainDB:
                     "VALUES (?,?,?,?,?,?,0)",
                     (txid_base, 0, to_addr, amount, "", self.height()))
 
-ois                troco = total - amount
-                if tro dissoco > 0:
+                troco = total - amount
+                if troco > 0:
                     self.conn.execute(
                         "INSERT INTO utxos"
                         "(txid, vout, address, amount, pubkey, block_height, spent) "
