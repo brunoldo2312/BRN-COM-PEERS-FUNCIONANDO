@@ -1,8 +1,5 @@
 """
 mongo_client.py — Cliente MongoDB compartilhado (explorer + nó)
-================================================================
-Substitui o script original (que tinha senha hardcoded).
-Usa env vars + URL-encoding automático + lazy connect.
 """
 from __future__ import annotations
 
@@ -42,7 +39,7 @@ class Mongo:
 
         self.uri = self._build_uri()
         if not self.uri:
-            log.warning("Mongo não configurado (defina MONGO_URI ou MONGO_USER/PASS/HOST)")
+            log.warning("Mongo não configurado")
 
     @staticmethod
     def _build_uri() -> Optional[str]:
@@ -108,5 +105,4 @@ class Mongo:
             self._client = None
 
 
-# Singleton
 mongo = Mongo()
