@@ -1,27 +1,30 @@
 """
-main.py — Entrypoint unificado do nó BRN (v11)
+main.py — Entrypoint unificado do nó BRN (v12)
 ================================================================
-Herança v8.3: L2 BTC->BRN + Checkpoints assinados.
-Herança v10.1: Audit, HTTPS opcional, verify de boot, shutdown limpo.
-
-v11 (correções e adições):
-  [FIX] BASE_DIR definido ANTES de _bootstrap_env (não depende do CWD)
-  [FIX] load_wallet/save_wallet com ordem correta de argumentos
-  [FIX] --password rejeitado (visível em ps)
+v12 (novo):
+  [NEW] Bloco _HARDCODED_DEFAULTS — configs direto no Python
+        (env vars do sistema e brn_network.env têm prioridade)
+  [NEW] Tailscale automático no boot — chama brn_tailscale_setup.py --auto
+        antes de subir o P2P (se TS_AUTH_KEY estiver definida)
+  [NEW] --no-tailscale para pular o setup do Tailscale
+v11:
+  [FIX] BASE_DIR definido ANTES de _bootstrap_env
+  [FIX] load_wallet/save_wallet com ordem correta
+  [FIX] --password rejeitado
   [FIX] _is_origin fail-safe: na dúvida, CLIENTE
-  [FIX] WEB_HOST / EXPLORER_HOST configuráveis (default 127.0.0.1)
+  [FIX] WEB_HOST/EXPLORER_HOST configuráveis
   [FIX] 2º Ctrl+C força os._exit(1)
   [FIX] _verify_chain tri-state: OK / INVALID / ERROR
-  [FIX] _graceful_shutdown com timeout por serviço
-  [FIX] Audit de boot registrado DEPOIS do genesis
-  [FIX] Status loop loga erros (não engole)
-  [FIX] Miner wallet em miner_wallet.enc via secure_store
+  [FIX] _graceful_shutdown com timeout
+  [FIX] Audit de boot após genesis
+  [FIX] Status loop loga erros
+  [FIX] Miner wallet em miner_wallet.enc
   [FIX] SIGHUP tratado
-  [FIX] F-strings com aspas aninhadas removidas (compat. editores)
+  [FIX] F-strings com aspas aninhadas removidas
   [NEW] threading.excepthook + _thread_wrap
   [NEW] _check_required_modules() no boot
-  [NEW] Rendezvous discovery integrado (p2p.add_peer)
-  [NEW] Relay E2E (p2p_relay v2.0) com hooks opcionais
+  [NEW] Rendezvous discovery integrado
+  [NEW] Relay E2E (p2p_relay v2.0)
   [NEW] Mongo health no status loop
   [NEW] AUTO_MINE opt-in (BRN_AUTO_MINE=1)
 ================================================================
@@ -35,6 +38,7 @@ import argparse
 import threading
 import time
 import json
+import subprocess
 import urllib.request
 from pathlib import Path
 
@@ -64,7 +68,74 @@ def _bootstrap_env() -> None:
         print("[boot] aviso: falha lendo " + str(env_file) + ": " + str(e))
 
 
+# ============================================================
+# [v12] DEFAULTS HARDCODED
+# ------------------------------------------------------------
+# Aplica só se a variável NÃO estiver no ambiente.
+# Prioridade final:
+#   1) Shell / .bat (maior)
+#   2) brn_network.env
+#   3) _HARDCODED_DEFAULTS (menor)
+# ============================================================
+_HARDCODED_DEFAULTS = {
+    # --- Identidade do nó ---
+    "BRN_NODE_PASSWORD":       "senha-no-temp-123",
+    "BRN_NETWORK_SECRET":      "9226edea8ba62bc1c6ae36883c0536c95b4c85642195465d6c4d9456abef20f9",
+    "BRN_BOOTSTRAP_PEERS":     "192.168.0.19:6001",
+
+    # --- Carteira ---
+    "BRN_WEB_PASS":            "senha-temp-123",
+    "BRN_WALLET_SESSION_PASS": "senha-forte-da-carteira-2026",
+
+    # --- Modo ---
+    "BRN_IS_ORIGIN":           "0",
+
+    # --- HTTPS / Audit ---
+    "BRN_HTTPS":               "0",
+    "BRN_AUDIT_ENABLED":       "1",
+    "BRN_AUDIT_LOG":           "audit.log",
+
+    # --- P2P ---
+    "BRN_P2P_AUTH":            "optional",
+    "BRN_P2P_AUTH_WINDOW":     "30",
+    "BRN_P2P_NONCE_CACHE":     "10000",
+
+    # --- Verify ---
+    "BRN_SKIP_VERIFY":         "1",
+    "BRN_VERIFY_STRICT":       "0",
+
+    # --- Tracker ---
+    "BRN_TRACKER":             "https://brn-tracker.onrender.com",
+
+    # --- MongoDB ---
+    "MONGO_USER":              "brunolabncaolivira_db_user",
+    "MONGO_PASS":              "SUA_SENHA_DO_ATLAS_AQUI",
+    "MONGO_HOST":              "cluster0.vbxjymy.mongodb.net",
+    "MONGO_DB":                "brn_analytics",
+
+    # --- Tailscale ---
+    # Deixe vazio (ou com placeholder) para desabilitar Tailscale automático.
+    "TS_AUTH_KEY":             "",
+    "TS_API_KEY":              "",
+    "TS_TAILNET":              "",
+    "TS_HOSTNAME_PREFIX":      "brn-node",
+}
+
+
+def _apply_hardcoded_defaults() -> int:
+    """Aplica defaults sem sobrescrever env já definida. Retorna quantas aplicou."""
+    aplicados = 0
+    for k, v in _HARDCODED_DEFAULTS.items():
+        if k not in os.environ or os.environ[k] == "":
+            os.environ[k] = v
+            aplicados += 1
+    return aplicados
+
+
 _bootstrap_env()
+_aplicados = _apply_hardcoded_defaults()
+if _aplicados:
+    print("[boot] defaults aplicados: " + str(_aplicados) + " variáveis")
 
 
 # ============================================================
@@ -188,10 +259,54 @@ def _close_audit() -> None:
 
 
 # ============================================================
+# [v12] TAILSCALE AUTO-SETUP
+# ============================================================
+def _setup_tailscale_auto(log) -> bool:
+    """
+    Chama brn_tailscale_setup.py --auto se TS_AUTH_KEY estiver definida.
+    Retorna True se OK (ou se Tailscale estiver desabilitado), False se falhou.
+    """
+    auth_key = os.environ.get("TS_AUTH_KEY", "").strip()
+    if not auth_key:
+        log.info("Tailscale: desabilitado (TS_AUTH_KEY vazia)")
+        return True
+
+    setup_path = BASE_DIR / "brn_tailscale_setup.py"
+    if not setup_path.exists():
+        log.warning("Tailscale: brn_tailscale_setup.py não encontrado — pulando")
+        return True
+
+    log.info("Tailscale: configurando automaticamente...")
+    try:
+        r = subprocess.run(
+            [sys.executable, str(setup_path), "--auto"],
+            capture_output=True, text=True, timeout=180,
+            cwd=str(BASE_DIR),
+        )
+        if r.returncode == 0:
+            log.info("Tailscale: OK")
+            for line in (r.stdout or "").splitlines()[-6:]:
+                if line.strip():
+                    log.info("  " + line)
+            return True
+        log.warning("Tailscale: falhou (código " + str(r.returncode) + ")")
+        for line in (r.stdout or "").splitlines()[-4:]:
+            if line.strip():
+                log.warning("  " + line)
+        return False
+    except subprocess.TimeoutExpired:
+        log.warning("Tailscale: timeout de 180s — continuando sem VPN")
+        return False
+    except Exception as e:
+        log.warning("Tailscale: erro — " + str(e))
+        return False
+
+
+# ============================================================
 # ARGS
 # ============================================================
 def parse_args():
-    p = argparse.ArgumentParser(prog="main.py", description="BRN Node v11")
+    p = argparse.ArgumentParser(prog="main.py", description="BRN Node v12")
     p.add_argument("--status", action="store_true")
     p.add_argument("--headless", action="store_true")
     p.add_argument("--read-only", action="store_true")
@@ -216,6 +331,8 @@ def parse_args():
                    help="Força relay desligado")
     p.add_argument("--verify-only", action="store_true")
     p.add_argument("--skip-verify", action="store_true")
+    p.add_argument("--no-tailscale", action="store_true",
+                   help="Desabilita setup automático do Tailscale neste boot")
     return p.parse_args()
 
 
@@ -378,10 +495,12 @@ def do_status(cfg):
     https = os.environ.get("BRN_HTTPS", "0") == "1"
     audit = os.environ.get("BRN_AUDIT_ENABLED", "1") == "1"
     rdv   = os.environ.get("BRN_RENDEZVOUS_URL", "").strip()
+    ts    = os.environ.get("TS_TAILNET", "").strip()
 
     print(" HTTPS       : " + ("SIM" if https else "não"))
     print(" Audit log   : " + ("SIM" if audit else "não"))
     print(" Rendezvous  : " + (rdv if rdv else "(não configurado)"))
+    print(" Tailscale   : " + (ts if ts else "(desabilitado)"))
     print(" Auto-mine   : " + ("SIM" if AUTO_MINE else "não"))
     print()
 
@@ -426,7 +545,6 @@ def do_status(cfg):
         except Exception as e:
             print(" DB height   : erro (" + str(e) + ")")
 
-    # Mongo health (best-effort)
     try:
         from mongo_client import mongo
         ok, err = mongo.ping()
@@ -683,7 +801,6 @@ def _graceful_shutdown(log) -> None:
     with _services_lock:
         services = list(_running_services)
 
-    # Para em ordem reversa (últimos a subir = primeiros a parar)
     for name, svc in reversed(services):
         _stop_with_timeout(name, svc, timeout=5.0, log=log)
 
@@ -739,6 +856,7 @@ def main():
     log.info(" HTTPS: " + ("ON" if os.environ.get("BRN_HTTPS") == "1" else "off")
              + " | Rendezvous: " + os.environ.get("BRN_RENDEZVOUS_URL", "—")
              + " | Auto-mine: " + ("ON" if AUTO_MINE else "off"))
+    log.info(" Tailscale: " + (os.environ.get("TS_TAILNET", "").strip() or "desabilitado"))
     log.info("=" * 60)
 
     # ---- comandos que saem sozinhos ----
@@ -771,6 +889,12 @@ def main():
     if missing:
         log.error("Módulos obrigatórios faltando: " + ", ".join(missing))
         return 1
+
+    # ---- [v12] Tailscale automático (antes de P2P) ----
+    if not args.no_tailscale:
+        _setup_tailscale_auto(log)
+    else:
+        log.info("Tailscale: pulado por --no-tailscale")
 
     # ---- identidade ----
     node_password = _resolve_password(args)
@@ -967,6 +1091,7 @@ def main():
         "node_id":    node_id_pub[:16],
         "rendezvous": bool(rdv),
         "relay":      bool(relay),
+        "tailscale":  bool(os.environ.get("TS_TAILNET", "").strip()),
     })
 
     log.info("Nó pronto. Ctrl+C para encerrar.")
