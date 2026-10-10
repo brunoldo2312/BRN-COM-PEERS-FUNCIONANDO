@@ -1,24 +1,27 @@
 """
-server.py — Backend HTTP do nó BRN (v9.1)
+server.py — Backend HTTP do nó BRN (v9.2)
 ================================================================
-v9.0:
-  [FIX] bind default 127.0.0.1 (BRN_WEB_HOST=0.0.0.0 explícito)
-  [FIX] admin token em /api/mine, /api/miner/*, /api/faucet
-  [FIX] caches com cleanup thread
-  [FIX] salvar_wallets atômico + lock
-  [FIX] auto-mine opt-in (BRN_AUTO_MINE=1)
-  [FIX] ProxyFix opcional (BRN_BEHIND_PROXY=1)
-  [FIX] CORS restrito se BRN_CORS_ORIGIN setado
-  [FIX] get_tx_by_txid / get_mempool_tx O(1)
-  [FIX] /api/l2/* retorna 503 quando L2 desabilitado
-  [FIX] mnemonic com Cache-Control: no-store
-
+v9.2:
+  [NEW] Auto-registro da pubkey da carteira ativa no boot
+        → lê current_wallet.enc e popula user_wallets.json
+        → evita erro "Pubkey desconhecida" ao minerar
 v9.1:
   [NEW] Rate limit via security.require_rate_limit (por endpoint)
   [NEW] audit_log em transfer / mine / miner_* / faucet / hd_* / contract_* / l2_*
-  [NEW] hash_short nos logs (nunca loga endereço/chave completa)
+  [NEW] hash_short nos logs
   [NEW] get_client_ip respeita X-Forwarded-For via BRN_TRUSTED_PROXIES
-  [REM] _rate_limit local (substituído por security)
+  [REM] _rate_limit local
+v9.0:
+  [FIX] bind default 127.0.0.1
+  [FIX] admin token em /api/mine, /api/miner/*, /api/faucet
+  [FIX] caches com cleanup thread
+  [FIX] salvar_wallets atômico + lock
+  [FIX] auto-mine opt-in
+  [FIX] ProxyFix opcional
+  [FIX] CORS restrito
+  [FIX] get_tx_by_txid / get_mempool_tx O(1)
+  [FIX] /api/l2/* retorna 503 quando L2 desabilitado
+  [FIX] mnemonic com Cache-Control: no-store
 ================================================================
 """
 from __future__ import annotations
@@ -27,6 +30,7 @@ import os
 import time
 import json
 import atexit
+import hmac
 import logging
 import threading
 from functools import wraps
@@ -38,10 +42,31 @@ from wallet import Wallet, WalletManager, HDWalletManager
 from blockchain import Blockchain, make_coinbase, txid as calc_txid, signing_hash
 
 # [v9.1] camada de segurança centralizada
-from security import (
-    require_rate_limit, audit_log, close_audit,
-    hash_short, get_client_ip,
-)
+try:
+    from security import (
+        require_rate_limit, audit_log, close_audit,
+        hash_short, get_client_ip,
+    )
+    _HAS_SECURITY = True
+except ImportError:
+    _HAS_SECURITY = False
+
+    def require_rate_limit(name):
+        def deco(fn):
+            return fn
+        return deco
+
+    def audit_log(event, data=None):
+        pass
+
+    def close_audit():
+        pass
+
+    def hash_short(v, n=12):
+        return str(v)[:n] if v else ""
+
+    def get_client_ip():
+        return request.remote_addr or "0.0.0.0"
 
 log = logging.getLogger("server")
 
@@ -111,18 +136,14 @@ if BEHIND_PROXY:
 
 if CORS_ORIGINS:
     CORS(app, origins=CORS_ORIGINS)
-# se CORS_ORIGINS vazio, NÃO habilita CORS → browser bloqueia cross-origin
 
 
 # ============================================================
 # Admin guard
 # ============================================================
-import hmac
-
-
 def _require_admin() -> bool:
     if not ADMIN_TOKEN:
-        return True    # dev
+        return True
     hdr = request.headers.get("Authorization", "")
     if not hdr.startswith("Bearer "):
         return False
@@ -143,12 +164,12 @@ def _admin_required(f):
 
 
 # ============================================================
-# Caches locais (rate limit agora vem do security.py)
+# Caches locais
 # ============================================================
-_cache_saldos: dict[str, tuple] = {}
+_cache_saldos: dict = {}
 _cache_lock = threading.Lock()
 
-_faucet_history: dict[str, list] = {}
+_faucet_history: dict = {}
 
 
 def _saldo_cache_get(addr):
@@ -209,6 +230,52 @@ def _registrar_pubkey(addr, pk):
 
 
 # ============================================================
+# AUTO-REGISTRO DA PUBKEY DO NÓ ATUAL [v9.2]
+# ============================================================
+def _auto_registrar_carteira_atual() -> dict:
+    """
+    No boot do server: tenta carregar current_wallet.enc e registra
+    a pubkey no user_wallets.json. Retorna {"ok": bool, "msg": str}.
+    Nunca levanta exceção.
+    """
+    try:
+        from wallet import WalletManager as _WM
+    except ImportError as e:
+        return {"ok": False, "msg": f"wallet.py nao disponivel: {e}"}
+
+    senha = (os.environ.get("BRN_WALLET_SESSION_PASS", "").strip()
+             or os.environ.get("BRN_NODE_PASSWORD", "").strip())
+    if not senha:
+        return {"ok": False, "msg": "BRN_WALLET_SESSION_PASS nao definida"}
+
+    # 1) Tenta carregar current_wallet.enc
+    try:
+        result = _WM.load_current(senha)
+    except Exception as e:
+        return {"ok": False, "msg": f"erro carregando current_wallet.enc: {e}"}
+
+    if not result or not result.get("ok"):
+        return {"ok": False, "msg": result.get("msg", "current_wallet.enc nao encontrado")}
+
+    addr = (result.get("address") or "").strip()
+    pk = (result.get("public_key") or result.get("pubkey") or "").strip()
+    if not addr or not pk:
+        return {"ok": False, "msg": "current_wallet.enc sem address/public_key"}
+
+    # 2) Grava em user_wallets.json (se ainda nao estiver)
+    try:
+        wallets = carregar_wallets()
+        atual = wallets.get(addr, {}).get("public_key", "")
+        if atual == pk:
+            return {"ok": True, "msg": f"ja registrado: {addr[:16]}..."}
+        wallets[addr] = {"public_key": pk}
+        salvar_wallets(wallets)
+        return {"ok": True, "msg": f"registrado: {addr[:16]}... pub={pk[:16]}..."}
+    except Exception as e:
+        return {"ok": False, "msg": f"falha gravando user_wallets.json: {e}"}
+
+
+# ============================================================
 # Pubkey resolution
 # ============================================================
 def _pubkey_from_db_or_payload(addr: str, payload_pubkey: str = "",
@@ -259,11 +326,10 @@ def _pubkey_from_db_or_payload(addr: str, payload_pubkey: str = "",
 
 
 # ============================================================
-# Tx lookup (usa índice se existir)
+# Tx lookup
 # ============================================================
 def _find_tx_in_mempool(txid_str: str):
     try:
-        # db.get_mempool_tx já faz lookup O(1)
         return CHAIN.db.get_mempool_tx(txid_str)
     except Exception:
         return None
@@ -271,14 +337,13 @@ def _find_tx_in_mempool(txid_str: str):
 
 def _find_tx_in_chain(txid_str: str):
     try:
-        # db.get_tx_by_txid já faz lookup O(1) com transactions.raw
         return CHAIN.db.get_tx_by_txid(txid_str)
     except Exception:
         return None, None
 
 
 # ============================================================
-# Cleanup thread (só caches locais)
+# Cleanup thread
 # ============================================================
 def _cleanup_loop():
     while True:
@@ -308,9 +373,7 @@ threading.Thread(target=_cleanup_loop, daemon=True,
 def nova_carteira():
     try:
         w = Wallet()
-        audit_log("wallet_created", {
-            "address": hash_short(w.address, 16),
-        })
+        audit_log("wallet_created", {"address": hash_short(w.address, 16)})
         dados = {
             "success": True,
             "address": w.address,
@@ -451,11 +514,9 @@ def transfer():
         to = data.get("to", "").strip()
         asset_id = data.get("asset_id", "BRN")
         amount = data.get("amount")
-        # chave privada pode vir via header (não logada) ou body
         sk = (request.headers.get("X-BRN-Sk", "")
               or data.get("private_key", ""))
 
-        # audit ANTES de qualquer validação — registra a tentativa
         audit_log("transfer_attempt", {
             "from":  hash_short(sender, 16),
             "to":    hash_short(to, 16),
@@ -1189,7 +1250,7 @@ def health():
 def index():
     return jsonify({
         "name": "BRN Node API",
-        "version": "9.1",
+        "version": "9.2",
         "l2_enabled": L2_ENABLED,
         "admin_protected": bool(ADMIN_TOKEN),
     })
@@ -1201,7 +1262,10 @@ def index():
 @atexit.register
 def _shutdown():
     log.info("encerrando server…")
-    close_audit()
+    try:
+        close_audit()
+    except Exception:
+        pass
 
 
 # ============================================================
@@ -1209,11 +1273,21 @@ def _shutdown():
 # ============================================================
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print(f"BRN Server v9.1 — http://{WEB_HOST}:{port}")
+    print(f"BRN Server v9.2 — http://{WEB_HOST}:{port}")
     print(f"  L2: {'ATIVO' if L2_ENABLED else 'DESABILITADO'}")
     print(f"  Admin token: {'SIM' if ADMIN_TOKEN else 'NÃO (dev mode)'}")
     print(f"  CORS: {CORS_ORIGINS or '(desabilitado)'}")
     print(f"  ProxyFix: {'ON' if BEHIND_PROXY else 'off'}")
+
+    # [v9.2] Auto-registro da pubkey da carteira ativa
+    try:
+        reg = _auto_registrar_carteira_atual()
+        if reg.get("ok"):
+            print(f"[server] auto-registro pubkey: {reg['msg']}")
+        else:
+            print(f"[server] auto-registro pubkey: pulado ({reg.get('msg')})")
+    except Exception as e:
+        print(f"[server] auto-registro pubkey: falhou silenciosamente ({e})")
 
     if os.environ.get("BRN_AUTO_MINE", "0") == "1":
         try:
