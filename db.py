@@ -1,4 +1,4 @@
-"""db.py — Banco SQLite do BRN (v6.1)
+"""db.py — Banco SQLite do BRN (v6.2)
 v4: + delete_blocks_above, + get_blocks_range, + peer score
 v5: + get_next_nonce, + get_nonce_for_pubkey (proteção replay)
 v6: + contratos inteligentes + L2 (BTC->BRN)
@@ -6,8 +6,11 @@ v6.1:
   + transactions.raw BLOB (migração automática)
   + remover_peer_por_pubkey()
   + get_tx_by_txid() O(1)
-  + índice em peers.public_key
+v6.2:
+  + backfill automático de transactions.raw no __init__ (idempotente)
+  + pode ser desabilitado com BRN_SKIP_RAW_BACKFILL=1
 """
+import os
 import time
 import zlib
 import sqlite3
@@ -27,6 +30,8 @@ class ChainDB:
                   "PRAGMA mmap_size=268435456", "PRAGMA foreign_keys=ON"):
             self.conn.execute(p)
         self._schema()
+        # [v6.2] migração automática — roda uma vez, idempotente
+        self._migrate_raw_txs()
 
     def _schema(self):
         with self.lock:
@@ -40,7 +45,6 @@ class ChainDB:
             CREATE INDEX IF NOT EXISTS idx_blocks_hash ON blocks(hash);
             CREATE INDEX IF NOT EXISTS idx_blocks_prev ON blocks(prev_hash);
 
-            -- [CHANGE] coluna `raw` adicionada em transactions
             CREATE TABLE IF NOT EXISTS transactions (
                 txid TEXT PRIMARY KEY, block_height INTEGER NOT NULL,
                 raw BLOB
@@ -78,7 +82,6 @@ class ChainDB:
             CREATE INDEX IF NOT EXISTS idx_peers_last_seen ON peers(last_seen);
             CREATE INDEX IF NOT EXISTS idx_peers_genesis ON peers(genesis_hash);
             CREATE INDEX IF NOT EXISTS idx_peers_node_id ON peers(node_id);
-            -- [CHANGE] índice para remover_peer_por_pubkey
             CREATE INDEX IF NOT EXISTS idx_peers_pubkey ON peers(public_key);
 
             CREATE TABLE IF NOT EXISTS network_events (
@@ -154,7 +157,7 @@ class ChainDB:
             CREATE INDEX IF NOT EXISTS idx_l2tx_escrow ON l2_txs(escrow_id);
             """)
 
-            # [CHANGE] migrações incrementais para DBs existentes
+            # --- migrações incrementais de colunas ---
             try:
                 cols = self.conn.execute("PRAGMA table_info(peers)").fetchall()
                 names = {c["name"] for c in cols}
@@ -176,6 +179,88 @@ class ChainDB:
             except Exception:
                 pass
 
+    # ==================== [v6.2] BACKFILL AUTOMÁTICO ====================
+    def _migrate_raw_txs(self):
+        """
+        Preenche `transactions.raw` para blocos antigos que só tinham
+        (txid, block_height). Roda uma vez por DB — idempotente.
+
+        Fast path: se não há NULLs, retorna em microssegundos.
+
+        Desabilite com:
+            export BRN_SKIP_RAW_BACKFILL=1
+        """
+        if os.environ.get("BRN_SKIP_RAW_BACKFILL", "0") == "1":
+            return
+
+        # 1) Conta NULLs (fast path)
+        try:
+            with self.lock:
+                n_null = self.conn.execute(
+                    "SELECT COUNT(*) AS c FROM transactions WHERE raw IS NULL"
+                ).fetchone()["c"]
+        except Exception as e:
+            print(f"[db] backfill: não consegui contar NULLs: {e}")
+            return
+
+        if not n_null:
+            return  # DB já migrado ou vazio → nada a fazer
+
+        print(f"[db] backfill: {n_null} tx antigas sem raw — migrando...")
+
+        # 2) Lista heights distintos com NULL
+        try:
+            with self.lock:
+                rows = self.conn.execute(
+                    "SELECT DISTINCT block_height FROM transactions "
+                    "WHERE raw IS NULL ORDER BY block_height"
+                ).fetchall()
+                heights = [r["block_height"] for r in rows]
+        except Exception as e:
+            print(f"[db] backfill: falha ao listar heights: {e}")
+            return
+
+        if not heights:
+            return
+
+        total = len(heights)
+        done = 0
+        t0 = time.time()
+
+        # 3) Bloco a bloco, commit por bloco
+        for h in heights:
+            try:
+                blk = self.get_block(h)
+                if not blk:
+                    continue
+
+                with self.lock:
+                    self.conn.execute("BEGIN IMMEDIATE TRANSACTION")
+                    try:
+                        for tx in blk["transactions"]:
+                            blob = zlib.compress(orjson.dumps(tx), level=6)
+                            self.conn.execute(
+                                "UPDATE transactions SET raw=? "
+                                "WHERE txid=? AND raw IS NULL",
+                                (blob, tx["txid"]))
+                        self.conn.execute("COMMIT")
+                    except Exception:
+                        self.conn.execute("ROLLBACK")
+                        continue
+            except Exception as e:
+                print(f"[db] backfill: bloco {h}: {e}")
+                continue
+
+            done += 1
+            if done % 500 == 0 or done == total:
+                dt = time.time() - t0
+                rate = done / dt if dt > 0 else 0.0
+                print(f"[db] backfill: {done}/{total} blocos "
+                      f"({rate:.0f} blocos/s)")
+
+        dt = time.time() - t0
+        print(f"[db] backfill concluído: {done}/{total} blocos em {dt:.1f}s")
+
     # ==================== BLOCOS ====================
     def add_block(self, block):
         with self.lock:
@@ -189,7 +274,6 @@ class ChainDB:
                      block["timestamp"], block["nonce"], block["merkle"],
                      block["difficulty"], blob))
 
-                # [CHANGE] grava o raw comprimido de cada tx
                 for tx in block["transactions"]:
                     tx_blob = zlib.compress(orjson.dumps(tx), level=6)
                     self.conn.execute(
@@ -252,7 +336,6 @@ class ChainDB:
                             for h in range(max(0, top - n + 1), top + 1)) if b]
 
     # ==================== TX LOOKUP O(1) ====================
-    # [CHANGE] novo método — usado pelo server.py em /api/tx-status
     def get_tx_by_txid(self, txid: str):
         """
         Retorna (tx_dict, height) ou (None, None).
@@ -560,12 +643,11 @@ class ChainDB:
 
     # ==================== PEERS ====================
     def upsert_peer(self, node_id, address, genesis_hash, version="?", height=0,
-                    is_miner=False, public_key="", metadata=None LIM):
+                    is_miner=False, public_key="", metadata=None):
         with self.lock:
-            agora = int(timeIT.time())
-            exist ?ente = self.conn",
-.execute(
-                "SELECT node_id FROM            peers WHERE address=?", (address, ()).fetchone()
+            agora = int(time.time())
+            existente = self.conn.execute(
+                "SELECT node_id FROM peers WHERE address=?", (address,)).fetchone()
             novo = existente is None
             self.conn.execute("""
                 INSERT INTO peers (address, node_id, genesis_hash, version, height,
@@ -640,7 +722,6 @@ class ChainDB:
         with self.lock:
             self.conn.execute("DELETE FROM peers WHERE address=?", (address,))
 
-    # [CHANGE] novo método — chamado pelo p2p_unified._on_peer_bad()
     def remover_peer_por_pubkey(self, pubkey: str) -> None:
         """Remove peer pelo public_key. Usado quando bane por pubkey."""
         if not pubkey:
@@ -666,7 +747,8 @@ class ChainDB:
 
     def ultimos_eventos(self, n=50):
         rows = self.conn.execute(
-            "SELECT * FROM network_events ORDER BY id DESCn,)).fetchall()
+            "SELECT * FROM network_events ORDER BY id DESC LIMIT ?",
+            (n,)).fetchall()
         return [dict(r) for r in rows]
 
     # ==================== CONTRATOS INTELIGENTES ====================
@@ -804,8 +886,8 @@ class ChainDB:
                     "VALUES (?,?,?,?,?,?,0)",
                     (txid_base, 0, to_addr, amount, "", self.height()))
 
-                troco = total - amount
-                if troco > 0:
+ois                troco = total - amount
+                if tro dissoco > 0:
                     self.conn.execute(
                         "INSERT INTO utxos"
                         "(txid, vout, address, amount, pubkey, block_height, spent) "
@@ -818,7 +900,6 @@ class ChainDB:
                 raise
 
     # ==================== CLOSE ====================
-    # [CHANGE] protegido contra duplo close
     def close(self):
         try:
             self.conn.close()
