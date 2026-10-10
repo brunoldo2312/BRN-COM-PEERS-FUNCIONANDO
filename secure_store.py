@@ -1,10 +1,31 @@
-# secure_store.py — BRN Chain v8.2
-# Formato: BRNS | ver | salt(16) | nonce(12) | ciphertext || tag(16)
+"""secure_store.py — BRN Chain v9.0
+================================================================
+Compatível com wallet.py v8 e main.py v11.
+
+Exporta:
+  - save_wallet / load_wallet                  (main.py)
+  - save_node_identity / load_node_identity    (main.py)
+  - delete_identity                            (main.py)
+  - encrypt_blob / decrypt_blob / MAGIC        (wallet.py)
+  - WalletSession                              (wallet.py)
+  - save_current_wallet / load_current_wallet  (wallet.py)
+  - migrate_current_wallet                     (wallet.py)
+  - constant_time_eq                           (wallet.py)
+
+Formato de arquivo cifrado:
+  BRNS | ver(1) | salt(16) | nonce(12) | ciphertext || tag(16)
+
+KDF:    Argon2id (argon2-cffi se disponível, senão cryptography)
+Cifra:  ChaCha20-Poly1305
+"""
 from __future__ import annotations
 
 import os
 import json
+import hmac
+import time
 import logging
+import threading
 from pathlib import Path
 
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
@@ -19,19 +40,25 @@ except ImportError:
 
 log = logging.getLogger("secure_store")
 
-SALT_SIZE  = 16
-KEY_SIZE   = 32
-NONCE_SIZE = 12
-TAG_SIZE   = 16
-MAGIC      = b"BRNS"
+# ============================================================
+# Constantes
+# ============================================================
+SALT_SIZE      = 16
+KEY_SIZE       = 32
+NONCE_SIZE     = 12
+TAG_SIZE       = 16
+MAGIC          = b"BRNS"
 FORMAT_VERSION = 1
 
 ARGON2_TIME_COST   = int(os.environ.get("BRN_ARGON2_TIME", "3"))
 ARGON2_MEMORY_COST = int(os.environ.get("BRN_ARGON2_MEMORY", "65536"))
 ARGON2_PARALLELISM = int(os.environ.get("BRN_ARGON2_PARALLEL", "4"))
-MIN_PASSWORD_LEN = 8
+MIN_PASSWORD_LEN   = 8
 
 
+# ============================================================
+# KDF
+# ============================================================
 def _derive_key(password: str, salt: bytes) -> bytes:
     if _ARGON2_IMPL == "cffi":
         return hash_secret_raw(
@@ -53,6 +80,9 @@ def _validate_password(password: str) -> None:
         raise ValueError(f"senha muito curta (mínimo {MIN_PASSWORD_LEN} caracteres)")
 
 
+# ============================================================
+# Cifra primitiva
+# ============================================================
 def _encrypt(data: bytes, key: bytes, aad: bytes = b"") -> bytes:
     nonce = os.urandom(NONCE_SIZE)
     return nonce + ChaCha20Poly1305(key).encrypt(nonce, data, aad)
@@ -65,26 +95,77 @@ def _decrypt(packed: bytes, key: bytes, aad: bytes = b"") -> bytes:
     return ChaCha20Poly1305(key).decrypt(nonce, ct, aad)
 
 
+# ============================================================
+# Escrita atômica
+# ============================================================
 def _atomic_write(path: str, data: bytes, mode: int = 0o600) -> None:
     p = Path(path)
     tmp = p.with_name(f".{p.name}.tmp.{os.getpid()}")
     fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
     try:
         with os.fdopen(fd, "wb") as f:
-            f.write(data); f.flush(); os.fsync(f.fileno())
-        os.replace(str(tmp), path)
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(str(tmp), str(path))
         try:
             dfd = os.open(str(p.parent) or ".", os.O_DIRECTORY)
-            try: os.fsync(dfd)
-            finally: os.close(dfd)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
         except OSError:
             pass
     except Exception:
-        try: tmp.unlink()
-        except FileNotFoundError: pass
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
         raise
 
 
+# ============================================================
+# Baixo nível: encrypt_blob / decrypt_blob (usado pelo wallet.py)
+# ============================================================
+def encrypt_blob(data: bytes, password: str) -> bytes:
+    """
+    Cifra bytes com senha.
+    Retorna: MAGIC + ver(1) + salt(16) + nonce(12) + ct+tag(16+)
+    """
+    _validate_password(password)
+    salt = os.urandom(SALT_SIZE)
+    key = _derive_key(password, salt)
+    return MAGIC + bytes([FORMAT_VERSION]) + salt + _encrypt(data, key, b"blob")
+
+
+def decrypt_blob(blob: bytes, password: str) -> bytes:
+    """Decifra bytes que foram cifrados por encrypt_blob."""
+    if len(blob) < len(MAGIC) + 1 + SALT_SIZE + NONCE_SIZE + TAG_SIZE:
+        raise ValueError("blob truncado")
+    if blob[:4] != MAGIC:
+        raise ValueError("magic inválido (não é formato BRN)")
+    ver = blob[4]
+    if ver != FORMAT_VERSION:
+        raise ValueError(f"versão não suportada: {ver}")
+    off = 5
+    salt = blob[off:off + SALT_SIZE]
+    off += SALT_SIZE
+    key = _derive_key(password, salt)
+    return _decrypt(blob[off:], key, b"blob")
+
+
+def constant_time_eq(a, b) -> bool:
+    """Comparação em tempo constante. Aceita str ou bytes."""
+    if isinstance(a, str):
+        a = a.encode()
+    if isinstance(b, str):
+        b = b.encode()
+    return hmac.compare_digest(a, b)
+
+
+# ============================================================
+# Alto nível: save/load blobs JSON
+# ============================================================
 def _save_blob(path: str, data: dict, password: str, aad: bytes) -> bool:
     _validate_password(password)
     salt = os.urandom(SALT_SIZE)
@@ -95,7 +176,7 @@ def _save_blob(path: str, data: dict, password: str, aad: bytes) -> bool:
     return True
 
 
-def _load_blob(path: str, password: str, aad: bytes) -> dict | None:
+def _load_blob(path: str, password: str, aad: bytes):
     p = Path(path)
     if not p.exists():
         return None
@@ -109,7 +190,8 @@ def _load_blob(path: str, password: str, aad: bytes) -> dict | None:
     if version != FORMAT_VERSION:
         raise ValueError(f"versão de formato não suportada: {version}")
     off = 5
-    salt = raw[off:off + SALT_SIZE]; off += SALT_SIZE
+    salt = raw[off:off + SALT_SIZE]
+    off += SALT_SIZE
     encrypted = raw[off:]
     key = _derive_key(password, salt)
     try:
@@ -124,13 +206,16 @@ def _load_blob(path: str, password: str, aad: bytes) -> dict | None:
         raise ValueError(f"Conteúdo inválido após decifrar: {e}")
 
 
+# ============================================================
+# API pública — Wallet / Node identity
+# ============================================================
 def save_wallet(wallet_data: dict, password: str,
                 path: str = "wallet_encrypted.dat") -> bool:
     return _save_blob(path, wallet_data, password, aad=b"wallet")
 
 
 def load_wallet(password: str,
-                path: str = "wallet_encrypted.dat") -> dict | None:
+                path: str = "wallet_encrypted.dat"):
     return _load_blob(path, password, aad=b"wallet")
 
 
@@ -140,7 +225,7 @@ def save_node_identity(identity_data: dict, password: str,
 
 
 def load_node_identity(password: str,
-                       path: str = "node_identity.enc") -> dict | None:
+                       path: str = "node_identity.enc"):
     return _load_blob(path, password, aad=b"node_identity")
 
 
@@ -152,8 +237,105 @@ def delete_identity(path: str = "node_identity.enc", secure: bool = True) -> boo
         try:
             size = p.stat().st_size
             with p.open("r+b") as f:
-                f.write(os.urandom(size)); f.flush(); os.fsync(f.fileno())
+                f.write(os.urandom(size))
+                f.flush()
+                os.fsync(f.fileno())
         except Exception as e:
             log.warning(f"overwrite de {path} falhou: {e}")
     p.unlink()
     return True
+
+
+# ============================================================
+# Carteira ativa (current_wallet.enc)
+# ============================================================
+CURRENT_WALLET_ENC  = os.environ.get("BRN_CURRENT_WALLET", "current_wallet.enc")
+CURRENT_WALLET_JSON = "current_wallet.json"
+
+
+def save_current_wallet(password: str, data: dict) -> dict:
+    try:
+        _save_blob(CURRENT_WALLET_ENC, data, password, b"current_wallet")
+        return {"ok": True, "path": CURRENT_WALLET_ENC}
+    except Exception as e:
+        return {"ok": False, "msg": str(e)}
+
+
+def load_current_wallet(password: str) -> dict:
+    try:
+        data = _load_blob(CURRENT_WALLET_ENC, password, b"current_wallet")
+        if data is None:
+            return {"ok": False, "msg": "current_wallet.enc não existe"}
+        return {"ok": True, **data}
+    except Exception as e:
+        return {"ok": False, "msg": str(e)}
+
+
+def migrate_current_wallet(password: str) -> dict:
+    """
+    Migra current_wallet.json (legado, texto puro) → current_wallet.enc (cifrado).
+    O JSON antigo é renomeado para .migrated.
+    """
+    if not os.path.exists(CURRENT_WALLET_JSON):
+        return {"ok": False, "msg": "current_wallet.json não existe"}
+    try:
+        with open(CURRENT_WALLET_JSON, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        r = save_current_wallet(password, data)
+        if not r.get("ok"):
+            return r
+        os.rename(CURRENT_WALLET_JSON, CURRENT_WALLET_JSON + ".migrated")
+        return {"ok": True, "msg": "migrado", "path": CURRENT_WALLET_ENC}
+    except Exception as e:
+        return {"ok": False, "msg": str(e)}
+
+
+# ============================================================
+# WalletSession (RAM com auto-lock)
+# ============================================================
+class WalletSession:
+    """
+    Mantém a carteira em RAM com TTL e auto-lock.
+    Thread-safe.
+    """
+
+    def __init__(self, ttl: int = 15 * 60):
+        self.ttl = ttl
+        self._data = None
+        self._unlocked_at = 0.0
+        self._lock = threading.RLock()
+
+    def unlock(self, data: dict) -> None:
+        with self._lock:
+            self._data = dict(data)
+            self._unlocked_at = time.time()
+
+    def lock(self) -> None:
+        with self._lock:
+            if self._data:
+                for k in list(self._data.keys()):
+                    try:
+                        del self._data[k]
+                    except Exception:
+                        pass
+            self._data = None
+            self._unlocked_at = 0.0
+
+    def get(self):
+        with self._lock:
+            if self._data is None:
+                return None
+            if time.time() - self._unlocked_at > self.ttl:
+                self.lock()
+                return None
+            return dict(self._data)
+
+    def seconds_until_lock(self) -> int:
+        with self._lock:
+            if self._data is None:
+                return 0
+            elapsed = time.time() - self._unlocked_at
+            return max(0, int(self.ttl - elapsed))
+
+    def is_unlocked(self) -> bool:
+        return self.get() is not None
