@@ -1,11 +1,6 @@
 # .github/workflows/python-publish.yml
 # Build + Release do nó BRN
-# - Roda em cada release publicado
-# - Também pode ser disparado manualmente (workflow_dispatch)
-# - Valida sintaxe de todos os .py
-# - Verifica dependências obrigatórias
-# - Empacota em .tar.gz e .zip
-# - Anexa os arquivos ao release do GitHub
+# Roda quando você cria um release no GitHub, ou manualmente.
 
 name: Build & Release BRN Node
 
@@ -20,7 +15,7 @@ on:
         default: 'dev'
 
 permissions:
-  contents: write   # necessário para anexar arquivos ao release
+  contents: write
 
 jobs:
   build:
@@ -44,17 +39,9 @@ jobs:
             pip install -r requirements.txt
           fi
 
-      - name: Syntax check (py_compile)
+      - name: Syntax check
         run: |
           python -m compileall -q . -x 'venv|\.venv|__pycache__|\.git'
-
-      - name: Dependency check
-        env:
-          BRN_NETWORK_SECRET: ci-test-secret-not-used-in-prod
-        run: |
-          if [ -f check_deps.py ]; then
-            python check_deps.py || echo "check_deps avisou problemas (não bloqueia)"
-          fi
 
       - name: Determinar versão
         id: ver
@@ -90,32 +77,19 @@ jobs:
             --exclude='dist' \
             ./ dist/brn-node/
 
-          # Garante que os arquivos essenciais estão no pacote
           test -f dist/brn-node/main.py || (echo "FALTA main.py" && exit 1)
           test -f dist/brn-node/requirements.txt || (echo "FALTA requirements.txt" && exit 1)
 
-          # Cria um README rápido de instalação dentro do pacote
           cat > dist/brn-node/COMO_RODAR.txt <<'EOF'
           BRN Node — Instalação rápida
           ============================
 
-          1. Instale dependências:
-             pip install -r requirements.txt
-
-          2. Defina as 2 variáveis obrigatórias:
-             export BRN_NETWORK_SECRET="sua-frase-secreta-longa-e-unica"
+          1. pip install -r requirements.txt
+          2. export BRN_NETWORK_SECRET="sua-frase-secreta"
              export BRN_NODE_PASSWORD="senha-forte-do-no"
-
-          3. Verifique dependências:
-             python check_deps.py
-
-          4. Rode em modo diagnóstico:
-             python main.py --status
-
-          5. Suba o nó:
-             python main.py
-
-          Mais info: leia o README.md
+          3. python check_deps.py
+          4. python main.py --status
+          5. python main.py
           EOF
 
           cd dist
@@ -124,7 +98,7 @@ jobs:
           zip -r "brn-node-${VERSION}.zip" brn-node/
           ls -la
 
-      - name: Upload artifact (sempre)
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: brn-node-${{ steps.ver.outputs.version }}
@@ -133,7 +107,7 @@ jobs:
             dist/brn-node-*.zip
           retention-days: 30
 
-      - name: Anexar ao release (somente em release)
+      - name: Anexar ao release
         if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2
         with:
