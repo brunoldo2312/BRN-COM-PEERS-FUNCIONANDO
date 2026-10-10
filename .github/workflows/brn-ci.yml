@@ -1,0 +1,55 @@
+name: BRN CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  check:
+    name: Syntax + deps
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+
+      - name: Syntax check (py_compile)
+        run: |
+          python -m compileall -q . -x 'venv|\.venv|__pycache__|\.git'
+
+      - name: Dependency check
+        env:
+          BRN_NETWORK_SECRET: ci-only-secret
+        run: |
+          if [ -f check_deps.py ]; then
+            python check_deps.py
+          else
+            echo "check_deps.py não encontrado — pulando"
+          fi
+
+      - name: Env template check
+        run: |
+          # Garante que não há segredos commitados
+          if [ -f brn_network.env ]; then
+            if grep -qE '^BRN_NETWORK_SECRET=.+' brn_network.env; then
+              echo "::error::brn_network.env contém BRN_NETWORK_SECRET real — remova do Git"
+              exit 1
+            fi
+          fi
+          echo "OK — sem segredos detectados"
