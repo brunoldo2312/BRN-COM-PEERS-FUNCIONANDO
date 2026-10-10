@@ -1,23 +1,32 @@
 """
-server.py — Backend HTTP do nó BRN (v9.0)
-Mudanças v9.0:
+server.py — Backend HTTP do nó BRN (v9.1)
+================================================================
+v9.0:
   [FIX] bind default 127.0.0.1 (BRN_WEB_HOST=0.0.0.0 explícito)
-  [FIX] admin token (BRN_ADMIN_TOKEN) em /api/mine, /api/miner/*, /api/faucet
-  [FIX] caches (_ip_history, _cache_saldos, _faucet_history) com cleanup
+  [FIX] admin token em /api/mine, /api/miner/*, /api/faucet
+  [FIX] caches com cleanup thread
   [FIX] salvar_wallets atômico + lock
   [FIX] auto-mine opt-in (BRN_AUTO_MINE=1)
   [FIX] ProxyFix opcional (BRN_BEHIND_PROXY=1)
   [FIX] CORS restrito se BRN_CORS_ORIGIN setado
-  [FIX] `_find_tx_in_chain` usa db.get_tx_by_txid se existir
-  [FIX] /api/l2/* retorna 503 (não 400) quando L2 desabilitado
-  [FIX] mnemonic nunca logado + Cache-Control: no-store
+  [FIX] get_tx_by_txid / get_mempool_tx O(1)
+  [FIX] /api/l2/* retorna 503 quando L2 desabilitado
+  [FIX] mnemonic com Cache-Control: no-store
+
+v9.1:
+  [NEW] Rate limit via security.require_rate_limit (por endpoint)
+  [NEW] audit_log em transfer / mine / miner_* / faucet / hd_* / contract_* / l2_*
+  [NEW] hash_short nos logs (nunca loga endereço/chave completa)
+  [NEW] get_client_ip respeita X-Forwarded-For via BRN_TRUSTED_PROXIES
+  [REM] _rate_limit local (substituído por security)
+================================================================
 """
 from __future__ import annotations
 
 import os
 import time
 import json
-import hmac
+import atexit
 import logging
 import threading
 from functools import wraps
@@ -27,6 +36,12 @@ from flask_cors import CORS
 
 from wallet import Wallet, WalletManager, HDWalletManager
 from blockchain import Blockchain, make_coinbase, txid as calc_txid, signing_hash
+
+# [v9.1] camada de segurança centralizada
+from security import (
+    require_rate_limit, audit_log, close_audit,
+    hash_short, get_client_ip,
+)
 
 log = logging.getLogger("server")
 
@@ -46,14 +61,11 @@ CHAIN_LOCK       = threading.RLock()
 WALLETS_FILE         = "user_wallets.json"
 CURRENT_WALLET_FILE  = "current_wallet.json"
 
-FAUCET_AMOUNT_BRN    = 10
+FAUCET_AMOUNT_BRN      = 10
 FAUCET_MAX_PER_ADDRESS = 3
-FAUCET_COOLDOWN_S    = 60 * 60
+FAUCET_COOLDOWN_S      = 60 * 60
 
-RATE_LIMIT      = 30
-RATE_WINDOW_S   = 60
-
-CACHE_TTL_S     = 5
+CACHE_TTL_S      = 5
 
 # ---- L2 (opcional) ----
 try:
@@ -99,14 +111,15 @@ if BEHIND_PROXY:
 
 if CORS_ORIGINS:
     CORS(app, origins=CORS_ORIGINS)
-else:
-    # sem CORS por padrão — browser bloqueia cross-origin
-    pass
+# se CORS_ORIGINS vazio, NÃO habilita CORS → browser bloqueia cross-origin
 
 
 # ============================================================
 # Admin guard
 # ============================================================
+import hmac
+
+
 def _require_admin() -> bool:
     if not ADMIN_TOKEN:
         return True    # dev
@@ -120,37 +133,22 @@ def _admin_required(f):
     @wraps(f)
     def wrapper(*args, **kwargs):
         if not _require_admin():
+            audit_log("admin_denied", {
+                "path": request.path,
+                "ip":   get_client_ip(),
+            })
             return jsonify({"ok": False, "msg": "unauthorized"}), 401
         return f(*args, **kwargs)
     return wrapper
 
 
 # ============================================================
-# Rate limit + caches
+# Caches locais (rate limit agora vem do security.py)
 # ============================================================
-_ip_history: dict[str, list] = {}
-_rate_lock = threading.Lock()
-
 _cache_saldos: dict[str, tuple] = {}
 _cache_lock = threading.Lock()
 
 _faucet_history: dict[str, list] = {}
-
-
-def _rate_limit(f):
-    @wraps(f)
-    def wrapper(*args, **kwargs):
-        ip = request.remote_addr or "?"
-        agora = time.time()
-        with _rate_lock:
-            hist = _ip_history.setdefault(ip, [])
-            hist[:] = [t for t in hist if agora - t < RATE_WINDOW_S]
-            if len(hist) >= RATE_LIMIT:
-                return jsonify({"success": False,
-                                "error": "Muitas requisicoes."}), 429
-            hist.append(agora)
-        return f(*args, **kwargs)
-    return wrapper
 
 
 def _saldo_cache_get(addr):
@@ -265,53 +263,28 @@ def _pubkey_from_db_or_payload(addr: str, payload_pubkey: str = "",
 # ============================================================
 def _find_tx_in_mempool(txid_str: str):
     try:
-        if hasattr(CHAIN.db, "get_mempool_tx"):
-            return CHAIN.db.get_mempool_tx(txid_str)
-        for t in CHAIN.db.all_mempool(limit=10000):
-            if t.get("txid") == txid_str:
-                return t
+        # db.get_mempool_tx já faz lookup O(1)
+        return CHAIN.db.get_mempool_tx(txid_str)
     except Exception:
-        pass
-    return None
+        return None
 
 
 def _find_tx_in_chain(txid_str: str):
     try:
-        if hasattr(CHAIN.db, "get_tx_by_txid"):
-            return CHAIN.db.get_tx_by_txid(txid_str)
+        # db.get_tx_by_txid já faz lookup O(1) com transactions.raw
+        return CHAIN.db.get_tx_by_txid(txid_str)
     except Exception:
-        pass
-
-    # fallback: varredura (lento — migre para o índice)
-    try:
-        altura = CHAIN.db.height()
-        for h in range(altura + 1):
-            try:
-                block = CHAIN.db.get_block(h)
-            except Exception:
-                continue
-            if not block:
-                continue
-            for tx in block.get("transactions", []):
-                if tx.get("txid") == txid_str:
-                    return tx, h
-    except Exception:
-        pass
-    return None, None
+        return None, None
 
 
 # ============================================================
-# Cleanup thread
+# Cleanup thread (só caches locais)
 # ============================================================
 def _cleanup_loop():
     while True:
         time.sleep(300)
         agora = time.time()
         try:
-            with _rate_lock:
-                for ip in [k for k, v in _ip_history.items()
-                           if not v or agora - v[-1] > RATE_WINDOW_S]:
-                    del _ip_history[ip]
             with _cache_lock:
                 for a in [k for k, (ts, _) in _cache_saldos.items()
                           if agora - ts > CACHE_TTL_S * 10]:
@@ -331,10 +304,13 @@ threading.Thread(target=_cleanup_loop, daemon=True,
 # CARTEIRA
 # ============================================================
 @app.route("/api/nova-carteira", methods=["POST"])
-@_rate_limit
+@require_rate_limit("nova_carteira")
 def nova_carteira():
     try:
         w = Wallet()
+        audit_log("wallet_created", {
+            "address": hash_short(w.address, 16),
+        })
         dados = {
             "success": True,
             "address": w.address,
@@ -467,7 +443,7 @@ def verificar_recebimento(address, txid_str):
 @app.route("/api/transfer", methods=["POST"])
 @app.route("/api/send", methods=["POST"])
 @app.route("/api/enviar", methods=["POST"])
-@_rate_limit
+@require_rate_limit("transfer")
 def transfer():
     try:
         data = request.get_json(force=True) or {}
@@ -478,6 +454,13 @@ def transfer():
         # chave privada pode vir via header (não logada) ou body
         sk = (request.headers.get("X-BRN-Sk", "")
               or data.get("private_key", ""))
+
+        # audit ANTES de qualquer validação — registra a tentativa
+        audit_log("transfer_attempt", {
+            "from":  hash_short(sender, 16),
+            "to":    hash_short(to, 16),
+            "asset": asset_id,
+        })
 
         if asset_id != "BRN":
             return jsonify({"ok": False, "msg": "So BRN."}), 400
@@ -536,10 +519,17 @@ def transfer():
 
             ok, msg = CHAIN.submit_tx(tx)
         if not ok:
+            audit_log("transfer_rejected", {"reason": msg})
             return jsonify({"ok": False, "msg": msg}), 400
 
         _saldo_cache_invalidate(sender)
         _saldo_cache_invalidate(to)
+        audit_log("transfer_ok", {
+            "from":        hash_short(sender, 16),
+            "to":          hash_short(to, 16),
+            "amount_sats": amount_sats,
+            "txid":        tx["txid"][:16],
+        })
         return jsonify({"ok": True, "txid": tx["txid"], "nonce": nonce,
                         "msg": "Aceita na mempool."})
     except Exception as e:
@@ -550,7 +540,7 @@ def transfer():
 # Miner endpoints (admin)
 # ============================================================
 @app.route("/api/mine", methods=["POST"])
-@_rate_limit
+@require_rate_limit("mine")
 @_admin_required
 def mine():
     try:
@@ -572,8 +562,14 @@ def mine():
         with CHAIN_LOCK:
             block = CHAIN.mine_block(miner, miner_pubkey)
         if not block:
+            audit_log("mine_failed", {"miner": hash_short(miner, 16)})
             return jsonify({"ok": False, "msg": "Falha ao minerar."}), 500
         _saldo_cache_invalidate(miner)
+        audit_log("mine_ok", {
+            "miner":  hash_short(miner, 16),
+            "height": block["height"],
+            "hash":   block["hash"][:16],
+        })
         return jsonify({"ok": True,
                         "msg": f"Bloco #{block['height']} minerado!",
                         "block": {"height": block["height"],
@@ -586,7 +582,7 @@ def mine():
 
 
 @app.route("/api/miner/start", methods=["POST"])
-@_rate_limit
+@require_rate_limit("miner_start")
 @_admin_required
 def miner_start():
     try:
@@ -614,6 +610,10 @@ def miner_start():
         from miner_loop import get_miner
         m = get_miner(CHAIN)
         ok, msg = m.start(addr, pubkey)
+        audit_log("miner_start_ok" if ok else "miner_start_failed", {
+            "addr": hash_short(addr, 16),
+            "msg":  msg,
+        })
         if not ok:
             return jsonify({"ok": False, "msg": msg, **m.status()}), 400
         return jsonify({"ok": True, "msg": "Minerador iniciado.", **m.status()})
@@ -622,13 +622,14 @@ def miner_start():
 
 
 @app.route("/api/miner/stop", methods=["POST"])
-@_rate_limit
+@require_rate_limit("miner_stop")
 @_admin_required
 def miner_stop():
     try:
         from miner_loop import get_miner
         m = get_miner(CHAIN)
         ok, msg = m.stop()
+        audit_log("miner_stop_ok" if ok else "miner_stop_failed", {"msg": msg})
         return jsonify({"ok": ok, "msg": msg, **m.status()})
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)}), 500
@@ -676,7 +677,7 @@ def miner_status():
 # Faucet (admin)
 # ============================================================
 @app.route("/api/faucet", methods=["POST"])
-@_rate_limit
+@require_rate_limit("faucet")
 @_admin_required
 def faucet():
     try:
@@ -690,6 +691,7 @@ def faucet():
         hist = _faucet_history.setdefault(addr, [])
         hist[:] = [t for t in hist if agora - t < FAUCET_COOLDOWN_S]
         if len(hist) >= FAUCET_MAX_PER_ADDRESS:
+            audit_log("faucet_limit", {"addr": hash_short(addr, 16)})
             return jsonify({"ok": False, "msg": "Limite atingido."}), 429
         if hist and agora - hist[-1] < FAUCET_COOLDOWN_S:
             falta = int(FAUCET_COOLDOWN_S - (agora - hist[-1]))
@@ -719,6 +721,11 @@ def faucet():
         except Exception:
             reward_sats = 0
 
+        audit_log("faucet_ok", {
+            "addr":        hash_short(addr, 16),
+            "height":      block["height"],
+            "reward_sats": reward_sats,
+        })
         return jsonify({"ok": True,
                         "msg": f"Faucet enviado! +{reward_sats/1e8} BRN",
                         "txid": block["transactions"][0]["txid"],
@@ -800,7 +807,7 @@ def get_nonce(pubkey):
 # HD wallet
 # ============================================================
 @app.route("/api/hd/create", methods=["POST"])
-@_rate_limit
+@require_rate_limit("hd_create")
 def hd_create():
     try:
         data = request.get_json(force=True) or {}
@@ -809,6 +816,9 @@ def hd_create():
             return jsonify({"ok": False, "msg": "strength invalido"}), 400
         result = HDWalletManager.create(strength=strength)
         _registrar_pubkey(result["address"], result.get("public_key", ""))
+        audit_log("hd_create_ok", {
+            "addr": hash_short(result.get("address", ""), 16),
+        })
         resp = jsonify({"ok": True, "warning": "GUARDE o mnemonico.", **result})
         resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
         return resp
@@ -817,7 +827,7 @@ def hd_create():
 
 
 @app.route("/api/hd/derive", methods=["POST"])
-@_rate_limit
+@require_rate_limit("hd_derive")
 def hd_derive():
     try:
         data = request.get_json(force=True) or {}
@@ -827,6 +837,10 @@ def hd_derive():
             return jsonify({"ok": False, "msg": "Mnemonico invalido"}), 400
         result = HDWalletManager.from_mnemonic(mn, index=index)
         _registrar_pubkey(result["address"], result.get("public_key", ""))
+        audit_log("hd_derive_ok", {
+            "addr":  hash_short(result.get("address", ""), 16),
+            "index": index,
+        })
         resp = jsonify({"ok": True, **result})
         resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
         return resp
@@ -923,7 +937,7 @@ def sync_info():
 # Contracts
 # ============================================================
 @app.route("/api/contract/deploy", methods=["POST"])
-@_rate_limit
+@require_rate_limit("contract_deploy")
 def contract_deploy():
     try:
         data = request.get_json(force=True) or {}
@@ -944,16 +958,24 @@ def contract_deploy():
 
         ok, msg = ContractVM.validate(code)
         if not ok:
+            audit_log("contract_deploy_rejected", {
+                "owner": hash_short(owner, 16),
+                "msg":   msg,
+            })
             return jsonify({"ok": False, "msg": msg}), 400
 
         r = deploy(CHAIN, owner, code, metadata)
+        audit_log("contract_deploy_ok", {
+            "owner":       hash_short(owner, 16),
+            "contract_id": str(r.get("contract_id", ""))[:16],
+        })
         return jsonify(r)
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)}), 500
 
 
 @app.route("/api/contract/call", methods=["POST"])
-@_rate_limit
+@require_rate_limit("contract_call")
 def contract_call():
     try:
         data = request.get_json(force=True) or {}
@@ -972,6 +994,10 @@ def contract_call():
                             "msg": f"contracts.py nao encontrado: {e}"}), 500
 
         r = _call(CHAIN, contract_id, caller, args)
+        audit_log("contract_call_ok", {
+            "contract_id": contract_id[:16],
+            "caller":      hash_short(caller, 16),
+        })
         return jsonify(r)
     except Exception as e:
         return jsonify({"ok": False, "msg": str(e)}), 500
@@ -1026,7 +1052,7 @@ def l2_quote():
 
 
 @app.route("/api/l2/create", methods=["POST"])
-@_rate_limit
+@require_rate_limit("l2_create")
 def l2_create():
     l2 = _get_l2()
     if not l2:
@@ -1043,6 +1069,11 @@ def l2_create():
             return jsonify({"error": "btc_sats deve ser > 0"}), 400
 
         order = l2.create_order(btc_sats, buyer)
+        audit_log("l2_create_ok", {
+            "escrow_id": str(order.get("escrow_id", ""))[:16],
+            "buyer":     hash_short(buyer, 16),
+            "btc_sats":  btc_sats,
+        })
         return jsonify(order)
     except Exception as e:
         return jsonify({"error": str(e)}), 400
@@ -1116,7 +1147,7 @@ def l2_stats():
 
 
 @app.route("/api/l2/cancel/<escrow_id>", methods=["POST"])
-@_rate_limit
+@require_rate_limit("l2_cancel")
 def l2_cancel(escrow_id):
     if not L2_ENABLED:
         return jsonify({"error": "L2 desabilitado"}), 503
@@ -1132,6 +1163,7 @@ def l2_cancel(escrow_id):
                             f"so pode cancelar OPEN, status atual {escrow['status']}"}), 400
 
         CHAIN.db.update_l2_escrow_status(escrow_id, "CANCELLED")
+        audit_log("l2_cancel_ok", {"escrow_id": escrow_id[:16]})
         return jsonify({"ok": True, "escrow_id": escrow_id,
                         "status": "CANCELLED"})
     except Exception as e:
@@ -1157,10 +1189,19 @@ def health():
 def index():
     return jsonify({
         "name": "BRN Node API",
-        "version": "9.0",
+        "version": "9.1",
         "l2_enabled": L2_ENABLED,
         "admin_protected": bool(ADMIN_TOKEN),
     })
+
+
+# ============================================================
+# Shutdown
+# ============================================================
+@atexit.register
+def _shutdown():
+    log.info("encerrando server…")
+    close_audit()
 
 
 # ============================================================
@@ -1168,9 +1209,11 @@ def index():
 # ============================================================
 if __name__ == "__main__":
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
-    print(f"BRN Server v9.0 — http://{WEB_HOST}:{port}")
+    print(f"BRN Server v9.1 — http://{WEB_HOST}:{port}")
     print(f"  L2: {'ATIVO' if L2_ENABLED else 'DESABILITADO'}")
     print(f"  Admin token: {'SIM' if ADMIN_TOKEN else 'NÃO (dev mode)'}")
+    print(f"  CORS: {CORS_ORIGINS or '(desabilitado)'}")
+    print(f"  ProxyFix: {'ON' if BEHIND_PROXY else 'off'}")
 
     if os.environ.get("BRN_AUTO_MINE", "0") == "1":
         try:
