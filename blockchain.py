@@ -1,34 +1,8 @@
 """
 blockchain.py — Núcleo da Blockchain BRN
 Versão: 9.1.4 | Data: 05/10/2026
-
-Changelog v9.1.4:
-- [SEGURANÇA] CHECKPOINTS ASSINADOS: a cada CHECKPOINT_INTERVAL (1000)
-  blocos, o no-origem assina o hash do bloco com sua chave Ed25519.
-  Todos os nos verificam a assinatura antes de aceitar blocos naquela
-  altura. Reorg nao pode violar nenhum checkpoint conhecido.
-
-v9.1.3:
-- [COMPAT] auth_tag so e obrigatorio a partir de AUTH_TAG_START_HEIGHT (6000).
-
-v9.1.1:
-- [PERF] _pow_search: time.sleep(0) a cada HASH_BATCH_SIZE iteracoes.
-- [FIX SEGURO] validate_tx: UTXOs com pubkey vazia/zeros validadas por endereco.
-
-v9.1:
-- [SEGURANÇA] Blocos carregam auth_tag = HMAC-SHA256(segredo, height:hash).
-
-v8.2:
-- mine_block e mine_block_interruptible usam hot loop baseado em bytes.
-- MAX_DIFFICULTY = 7.
-
-v8.1:
-- current_difficulty() respeita MAX_DIFFICULTY.
-
-v8.0:
-- Suporte a contratos inteligentes.
+(v9.1.4 — Checkpoints assinados + Auth Tag + Reorg + Contratos)
 """
-
 import os
 import time
 import hmac
@@ -53,11 +27,7 @@ MIN_RELAY_FEE = 1000
 MAX_REORG_DEPTH = 100
 
 HASH_BATCH_SIZE = 5000
-
-# v9.1.3: auth_tag obrigatorio apenas acima desta altura (cadeia legada abaixo)
 AUTH_TAG_START_HEIGHT = 6000
-
-# v9.1.4: checkpoints assinados
 CHECKPOINT_INTERVAL = 1000
 
 GENESIS_PREV = "0" * 64
@@ -74,20 +44,18 @@ NETWORK_SECRET = os.environ.get("BRN_NETWORK_SECRET", "").strip()
 
 
 # ============================================================
-# v9.1.4: CHECKPOINTS ASSINADOS (estado global)
+# v9.1.4: CHECKPOINTS ASSINADOS
 # ============================================================
-_checkpoints = {}             # {str(height): {height, hash, sig, pub, ts}}
-_checkpoint_priv = None       # Ed25519PrivateKey do no-origem
+_checkpoints = {}
+_checkpoint_priv = None
 
 
 def set_checkpoints(d: dict):
-    """Chamado pelo main.py no boot para carregar os checkpoints."""
     global _checkpoints
     _checkpoints = {str(k): v for k, v in (d or {}).items()}
 
 
 def set_checkpoint_priv(priv):
-    """Habilita a assinatura de novos checkpoints (so no-origem)."""
     global _checkpoint_priv
     _checkpoint_priv = priv
 
@@ -97,10 +65,6 @@ def get_checkpoints() -> dict:
 
 
 def _verify_checkpoint_for_block(block) -> tuple:
-    """
-    Se existir checkpoint para esta altura, o hash TEM que bater.
-    Retorna (ok, motivo).
-    """
     cp = _checkpoints.get(str(block["height"]))
     if not cp:
         return True, ""
@@ -122,7 +86,6 @@ def _verify_checkpoint_for_block(block) -> tuple:
 
 
 def _maybe_sign_checkpoint(block):
-    """Se for altura multipla de CHECKPOINT_INTERVAL, assina."""
     if _checkpoint_priv is None:
         return
     try:
@@ -146,10 +109,9 @@ def _maybe_sign_checkpoint(block):
 
 
 # ============================================================
-# AUTH TAG (HMAC do bloco)
+# AUTH TAG
 # ============================================================
-def compute_auth_tag(height: int, block_hash_hex: str,
-                     secret: str = None) -> str:
+def compute_auth_tag(height: int, block_hash_hex: str, secret: str = None) -> str:
     sec = secret if secret is not None else NETWORK_SECRET
     if not sec:
         return ""
@@ -197,7 +159,7 @@ def compute_merkle_root(txids):
 
 
 # ============================================================
-# SERIALIZAÇÃO CANÔNICA
+# SERIALIZAÇÃO
 # ============================================================
 def _tx_core(tx):
     inputs = [
@@ -210,9 +172,7 @@ def _tx_core(tx):
         for o in tx["outputs"]
     ]
     core = {
-        "v": _CORE_V,
-        "inputs": inputs,
-        "outputs": outputs,
+        "v": _CORE_V, "inputs": inputs, "outputs": outputs,
         "timestamp": tx["timestamp"],
         "locktime": tx.get("locktime", 0),
         "nonce": tx.get("nonce", 0),
@@ -237,7 +197,7 @@ def signing_hash(tx):
 
 
 # ============================================================
-# HOT LOOP DE PoW
+# HOT LOOP PoW
 # ============================================================
 def _pow_search(prev_hash, merkle, ts, diff, nonce_start=0,
                 should_continue=None, progress_cb=None):
@@ -256,9 +216,7 @@ def _pow_search(prev_hash, merkle, ts, diff, nonce_start=0,
                 return nonce, h.hex(), hashes_done + 1
             nonce += 1
         hashes_done += HASH_BATCH_SIZE
-
         time.sleep(0)
-
         if should_continue is not None and not should_continue():
             return None, None, hashes_done
         if progress_cb is not None:
@@ -269,7 +227,7 @@ def _pow_search(prev_hash, merkle, ts, diff, nonce_start=0,
 
 
 # ============================================================
-# COINBASE E GÊNESE
+# COINBASE / GÊNESE
 # ============================================================
 def make_coinbase(address, pubkey_hex, height, reward):
     if not pubkey_hex:
@@ -327,12 +285,10 @@ GENESIS_BLOCK = build_genesis()
 class Blockchain:
     def __init__(self, db_path="brn_v2_chain.db",
                  genesis_address=None, genesis_pubkey=None,
-                 auto_genesis=True,
-                 network_secret=None,
+                 auto_genesis=True, network_secret=None,
                  require_auth_tag=None):
         self.db = ChainDB(db_path)
         self.genesis_expected_hash = None
-
         self.network_secret = (network_secret
                                if network_secret is not None
                                else NETWORK_SECRET)
@@ -365,9 +321,7 @@ class Blockchain:
             "outputs": [{"address": address, "amount": GENESIS_REWARD,
                          "pubkey": pubkey_hex}],
             "timestamp": GENESIS_TIMESTAMP,
-            "locktime": 0,
-            "height": 0,
-            "nonce": 0,
+            "locktime": 0, "height": 0, "nonce": 0,
         }
         cb["txid"] = txid(cb)
         merkle = compute_merkle_root([cb["txid"]])
@@ -390,9 +344,6 @@ class Blockchain:
         if self.require_auth_tag is False:
             self.require_auth_tag = bool(self.network_secret)
 
-    # --------------------------------------------------------
-    # RECOMPENSA / DIFICULDADE / TRABALHO
-    # --------------------------------------------------------
     def current_reward(self, height):
         halvings = height // HALVING_INTERVAL
         if halvings >= 64:
@@ -428,9 +379,6 @@ class Blockchain:
     def cumulative_work_of_chain(self, blocks):
         return sum(work_from_difficulty(b["difficulty"]) for b in blocks)
 
-    # --------------------------------------------------------
-    # FEE
-    # --------------------------------------------------------
     def estimate_fee(self, priority="medium"):
         stats = self.db.mempool_stats()
         count = stats["count"]
@@ -457,9 +405,6 @@ class Blockchain:
                 in_sum += u["amount"]
         return in_sum - sum(o["amount"] for o in tx["outputs"])
 
-    # --------------------------------------------------------
-    # CONTRATOS
-    # --------------------------------------------------------
     def _validate_contract_tx(self, tx):
         tx_data = tx.get("data") or {}
         t = tx_data.get("type")
@@ -509,9 +454,6 @@ class Blockchain:
             return r
         raise ValueError(f"tipo de contrato desconhecido: {t}")
 
-    # --------------------------------------------------------
-    # VALIDAÇÃO DE TRANSAÇÃO
-    # --------------------------------------------------------
     def validate_tx(self, tx, from_mempool=False):
         from wallet import Wallet
         if not tx.get("inputs") or not tx.get("outputs"):
@@ -597,11 +539,7 @@ class Blockchain:
             return False, "falha na mempool"
         return True, tx["txid"]
 
-    # --------------------------------------------------------
-    # VALIDAÇÃO DE BLOCO (auth_tag + checkpoints)
-    # --------------------------------------------------------
     def validate_block(self, block, prev_block=None):
-        # Genesis
         if block["height"] == 0 and prev_block is None:
             if self.genesis_expected_hash and block["hash"] != self.genesis_expected_hash:
                 return False, (
@@ -610,14 +548,12 @@ class Blockchain:
                     f"  recebido: {block['hash'][:16]}..."
                 )
 
-        # Encadeamento
         if block["prev_hash"] != (prev_block["hash"] if prev_block else self.db.tip_hash()):
             return False, "prev_hash incorreto"
         expected_height = (prev_block["height"] + 1) if prev_block else self.db.height() + 1
         if block["height"] != expected_height:
             return False, "altura invalida"
 
-        # PoW
         if not meets_difficulty(block["hash"], block["difficulty"]):
             return False, "PoW invalido"
         h = block_hash(block["prev_hash"], block["merkle"], block["timestamp"],
@@ -627,16 +563,13 @@ class Blockchain:
         if compute_merkle_root([t["txid"] for t in block["transactions"]]) != block["merkle"]:
             return False, "merkle incorreto"
 
-        # v9.1.4: verifica checkpoint assinado (trava dura contra reorg)
         ok_cp, msg_cp = _verify_checkpoint_for_block(block)
         if not ok_cp:
             return False, msg_cp
 
-        # v9.1.3: AUTH TAG com corte em AUTH_TAG_START_HEIGHT
         if self.require_auth_tag:
             if not self.network_secret:
                 return False, "no exige auth_tag mas nao tem BRN_NETWORK_SECRET"
-
             if block["height"] > AUTH_TAG_START_HEIGHT:
                 tag = block.get("auth_tag")
                 if not tag:
@@ -651,7 +584,6 @@ class Blockchain:
                                            self.network_secret):
                         return False, "auth_tag invalido em bloco legado"
 
-        # Coinbase
         cb = block["transactions"][0]
         if cb["inputs"][0]["txid"] != "0" * 64:
             return False, "primeira tx nao e coinbase"
@@ -679,20 +611,13 @@ class Blockchain:
             return False, "coinbase acima do permitido"
         return True, "ok"
 
-    # --------------------------------------------------------
-    # ACEITAÇÃO DE BLOCO
-    # --------------------------------------------------------
     def accept_block(self, block):
         prev = self.db.get_block_by_hash(block["prev_hash"])
         ok, msg = self.validate_block(block, prev)
         if not ok:
             return False, msg
-
         self.db.add_block(block)
-
-        # v9.1.4: assina checkpoint se for altura multipla
         _maybe_sign_checkpoint(block)
-
         for i, t in enumerate(block["transactions"]):
             coinbase = (i == 0)
             self.db.apply_tx(t, block["height"], coinbase=coinbase)
@@ -707,9 +632,6 @@ class Blockchain:
                         print(f"[CONTRACT] tx {t['txid'][:16]}... falhou: {e}")
         return True, block["hash"]
 
-    # --------------------------------------------------------
-    # REORG
-    # --------------------------------------------------------
     def reorg_to(self, new_blocks):
         if not new_blocks:
             return False, "lista vazia"
@@ -726,14 +648,13 @@ class Blockchain:
         if not blocks_to_add:
             return False, "nada novo"
 
-        # v9.1.4: nova cadeia nao pode violar nenhum checkpoint conhecido
         for h_str, cp in _checkpoints.items():
             try:
                 h_int = int(h_str)
             except Exception:
                 continue
             if h_int <= fork_height:
-                continue  # antes do fork, nao muda
+                continue
             nb = next((b for b in blocks_to_add if b["height"] == h_int), None)
             if nb is None:
                 return False, f"nova cadeia nao contem checkpoint #{h_int}"
@@ -781,9 +702,6 @@ class Blockchain:
         print(f"[REORG] concluido! Altura: {self.db.height()}")
         return True, f"reorg ok ({len(blocks_to_add)} blocos)"
 
-    # --------------------------------------------------------
-    # MINERAÇÃO
-    # --------------------------------------------------------
     def _attach_auth_tag(self, block):
         tag = compute_auth_tag(block["height"], block["hash"],
                                self.network_secret)
@@ -803,7 +721,6 @@ class Blockchain:
         merkle = compute_merkle_root([t["txid"] for t in txs])
         prev_hash = self.db.tip_hash()
         ts = int(time.time())
-
         nonce, h_hex, _ = _pow_search(prev_hash, merkle, ts, diff)
         block = {"height": height, "hash": h_hex, "prev_hash": prev_hash,
                  "timestamp": ts, "nonce": nonce, "merkle": merkle,
@@ -825,13 +742,11 @@ class Blockchain:
         merkle = compute_merkle_root([t["txid"] for t in txs])
         prev_hash = self.db.tip_hash()
         ts = int(time.time())
-
         nonce, h_hex, _ = _pow_search(prev_hash, merkle, ts, diff,
                                        should_continue=should_continue,
                                        progress_cb=progress_cb)
         if nonce is None:
             return None
-
         block = {"height": height, "hash": h_hex, "prev_hash": prev_hash,
                  "timestamp": ts, "nonce": nonce, "merkle": merkle,
                  "difficulty": diff, "transactions": txs}
@@ -839,9 +754,6 @@ class Blockchain:
         ok, msg = self.accept_block(block)
         return block if ok else None
 
-    # --------------------------------------------------------
-    # CONFIRMAÇÕES
-    # --------------------------------------------------------
     def get_latest_height(self) -> int:
         return self.db.height()
 
@@ -855,9 +767,9 @@ class Blockchain:
         return self.get_latest_height() - tx_height
 
 
-# ------------------------------------------------------------
+# ============================================================
 # Plug do chain_validator
-# ------------------------------------------------------------
+# ============================================================
 try:
     from chain_validator import verify_chain as _verify_ext
 
