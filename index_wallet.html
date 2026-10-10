@@ -421,7 +421,7 @@
     </div>
   </div>
 
-  <div class="footer">BRN Wallet v3.6 · ponte pywebview · <span id="apiLbl">—</span></div>
+  <div class="footer">BRN Wallet v3.7 · ponte pywebview · <span id="apiLbl">—</span></div>
 </div>
 
 <script>
@@ -433,6 +433,7 @@
 let wallet = { address:"", private_key:"", public_key:"" };
 let ready = false;
 let miningRunning = false;
+let miningBusy = false;
 let lastSentTxid = "";
 
 // ============================================================
@@ -634,23 +635,21 @@ async function atualizarSaldo() {
 }
 
 // ============================================================
-// MINHAS TRANSAÇÕES (com direção, status e confirmações)
+// MINHAS TRANSAÇÕES
 // ============================================================
 async function carregarMinhasTxs() {
   if (!wallet.address) return;
   const tb = $("tbodyMyTxs");
   tb.innerHTML = '<tr><td colspan="5" style="color:#8b949e;">Carregando…</td></tr>';
 
-  // tenta endpoint novo; cai para o antigo se nao existir
   let txs = [];
   let ok = false;
   try {
     const r = await api("minhas_txs", wallet.address);
     if (r && r.ok) { txs = r.transactions || []; ok = true; }
-  } catch (e) { /* método nao exposto ou endpoint nao existe */ }
+  } catch (e) { /* método nao exposto */ }
 
   if (!ok) {
-    // fallback: endpoint antigo (só recebidas)
     try {
       const r = await api("list_transactions", wallet.address);
       if (r && !r.erro) {
@@ -712,7 +711,6 @@ async function carregarMinhasTxs() {
     tr.onclick = function() {
       $("verTxid").value = t.txid;
       $("verAddr").value = wallet.address;
-      // troca aba
       document.querySelectorAll(".tab").forEach(function(x){x.classList.remove("active")});
       document.querySelectorAll(".panel").forEach(function(x){x.classList.remove("active")});
       document.querySelector('.tab[data-tab="verificar"]').classList.add("active");
@@ -761,12 +759,15 @@ async function enviar() {
 }
 
 // ============================================================
-// MINERAÇÃO TOGGLE
+// MINERAÇÃO TOGGLE — v3.7
+// Agora envia a public_key junto com o endereço
 // ============================================================
 async function minerar() {
   clearMsg("mMine");
   if (!wallet.address) { msg("mMine", "❌ Gere/carregue uma carteira.", "err"); return; }
+  if (miningBusy) return;
 
+  miningBusy = true;
   const btn = $("bMinerar");
   btn.disabled = true;
 
@@ -780,14 +781,19 @@ async function minerar() {
     } catch (e) {
       msg("mMine", "❌ " + e.message, "err");
     } finally {
+      miningBusy = false;
       await updateMiningUI();
     }
   } else {
     btn.innerHTML = '<span class="spin"></span>Iniciando…';
     try {
-      const r = await api("start_mining", wallet.address);
+      // [v3.7] Envia public_key — o server usa direto, sem precisar ler arquivo
+      const r = await api("start_mining", wallet.address, wallet.public_key);
       if (r && r.ok) {
         msg("mMine", "⛏️ Mineração iniciada. Clique de novo para parar.", "ok", 6000);
+        miningRunning = true;
+      } else if (r && r.assumed) {
+        msg("mMine", "⛏️ " + (r.msg || "Mineração iniciada em background."), "info", 6000);
         miningRunning = true;
       } else {
         msg("mMine", "❌ " + ((r && r.msg) || "falha ao iniciar"), "err");
@@ -795,6 +801,7 @@ async function minerar() {
     } catch (e) {
       msg("mMine", "❌ " + e.message, "err");
     } finally {
+      miningBusy = false;
       await updateMiningUI();
     }
   }
@@ -807,19 +814,25 @@ async function updateMiningUI() {
     const box = $("miningInfo");
 
     miningRunning = !!(st && st.running);
-    btn.disabled = false;
+
+    if (!miningBusy) {
+      btn.disabled = false;
+      if (miningRunning) {
+        btn.className = "btn danger";
+        btn.textContent = "⏹️ Parar mineração";
+      } else {
+        btn.className = "btn p";
+        btn.textContent = "⛏️ Iniciar mineração";
+      }
+    }
 
     if (miningRunning) {
-      btn.className = "btn danger";
-      btn.textContent = "⏹️ Parar mineração";
       box.classList.add("show");
-      $("miningAddr").textContent  = st.address || "—";
-      $("miningCount").textContent = st.count || 0;
-      $("miningLast").textContent  = st.last_height != null ? "#" + st.last_height : "—";
+      $("miningAddr").textContent   = st.address || "—";
+      $("miningCount").textContent  = st.count || 0;
+      $("miningLast").textContent   = st.last_height != null ? "#" + st.last_height : "—";
       $("miningUptime").textContent = fmtUptime(st.uptime || 0);
     } else {
-      btn.className = "btn p";
-      btn.textContent = "⛏️ Iniciar mineração";
       box.classList.remove("show");
     }
   } catch (e) {
@@ -843,7 +856,7 @@ async function faucet() {
 }
 
 // ============================================================
-// VERIFICAÇÃO DE TRANSAÇÃO
+// VERIFICAÇÃO
 // ============================================================
 async function verificarTx() {
   clearMsg("mVerificar");
@@ -877,9 +890,7 @@ async function verificarTx() {
           "ok", 8000);
     } else {
       const tipo = r.status === "pending" ? "info" : "err";
-      msg("mVerificar",
-          "❌ Não chegou ainda · status: " + r.status,
-          tipo, 8000);
+      msg("mVerificar", "❌ Não chegou ainda · status: " + r.status, tipo, 8000);
     }
   } catch (e) {
     msg("mVerificar", "❌ " + e.message, "err");

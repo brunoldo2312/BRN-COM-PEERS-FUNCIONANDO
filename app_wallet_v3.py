@@ -1,10 +1,13 @@
 """
-app_wallet_v3.py — Carteira desktop BRN (PyWebView) | v3.5
+app_wallet_v3.py — Carteira desktop BRN (PyWebView) | v3.5.1
 ============================================================
 API exposta ao JavaScript via ponte pywebview.
 
+v3.5.1:
+  [FIX] start_mining() usa timeout curto (30s) e trata timeout como
+        "iniciado em background" em vez de reportar erro.
 v3.5:
-  [FIX] generate_wallet() agora salva current_wallet.enc automaticamente
+  [FIX] generate_wallet() salva current_wallet.enc automaticamente
   [FIX] start_mining() envia 'miner_pubkey' (chave que o server espera)
   [FIX] mine_block() envia 'miner_pubkey'
   [FIX] get_active_wallet() tenta .enc primeiro, depois .json (legado)
@@ -36,14 +39,17 @@ EXPLORER_URL = os.environ.get("BRN_EXPLORER_URL", f"http://127.0.0.1:{EXPLORER_P
 WEB_USER = os.environ.get("BRN_WEB_USER", "admin")
 WEB_PASS = os.environ.get("BRN_WEB_PASS", "")
 
-# Senha usada para cifrar a carteira ativa. Se não definida, cai em BRN_WEB_PASS.
+
 def _senha_carteira() -> str:
+    """Senha usada para cifrar a carteira ativa."""
     return (os.environ.get("BRN_WALLET_SESSION_PASS", "").strip()
             or os.environ.get("BRN_WEB_PASS", "").strip())
 
+
 TIMEOUT_LEITURA   = 30
 TIMEOUT_TX        = 120
-TIMEOUT_MINERACAO = 120
+TIMEOUT_MINERACAO = 300          # [v3.5.1] aumentado de 120 para 300
+TIMEOUT_MINER_START = 30         # [v3.5.1] iniciar deve responder rápido
 
 CACHE_TTL = 5
 WALLET_HTML = "index_wallet.html"
@@ -117,7 +123,6 @@ class WalletApi:
         (cifrada) + registra pubkey em user_wallets.json.
         """
         try:
-            # 1) Gera o par de chaves
             info = WalletManager.generate_keypair()
             addr = info.get("address", "")
             sk = info.get("private_key", "")
@@ -126,13 +131,13 @@ class WalletApi:
             if not addr or not sk or not pk:
                 return {"erro": "Falha ao gerar chaves (resposta incompleta)"}
 
-            # 2) Salva a carteira ativa CIFRADA (current_wallet.enc)
+            # 1) Salva a carteira ativa CIFRADA (current_wallet.enc)
             senha = _senha_carteira()
             if senha:
                 try:
                     r = WalletManager.save_current(addr, sk, pk, senha)
                     if r.get("ok"):
-                        log.info(f"Carteira ativa salva em current_wallet.enc")
+                        log.info("Carteira ativa salva em current_wallet.enc")
                     else:
                         log.warning(f"Falha ao salvar current_wallet.enc: {r.get('msg')}")
                 except Exception as e:
@@ -140,7 +145,7 @@ class WalletApi:
             else:
                 log.warning("BRN_WALLET_SESSION_PASS nao definida — carteira nao sera salva")
 
-            # 3) Registra pubkey em user_wallets.json (para o server ler)
+            # 2) Registra pubkey em user_wallets.json (para o server ler)
             try:
                 p = Path(__file__).parent / USER_WALLETS_FILE
                 w = {}
@@ -153,11 +158,10 @@ class WalletApi:
                     w = {}
                 w[addr] = {"public_key": pk}
                 p.write_text(json.dumps(w, indent=2), encoding="utf-8")
-                log.info(f"Pubkey registrada em user_wallets.json")
+                log.info("Pubkey registrada em user_wallets.json")
             except Exception as e:
                 log.warning(f"Erro salvando user_wallets.json: {e}")
 
-            # 4) Retorna o mesmo shape de antes (JS nao muda)
             return {
                 "address": addr,
                 "private_key": sk,
@@ -178,7 +182,6 @@ class WalletApi:
         Tenta carregar current_wallet.enc (cifrado, v9).
         Se nao existir, cai para current_wallet.json (legado plaintext).
         """
-        # 1) Tenta .enc primeiro
         senha = _senha_carteira()
         if senha:
             try:
@@ -193,7 +196,6 @@ class WalletApi:
             except Exception as e:
                 log.debug(f"current_wallet.enc nao carregou: {e}")
 
-        # 2) Fallback: .json legado
         try:
             p = Path(__file__).parent / CURRENT_WALLET_JSON
             if not p.exists():
@@ -210,7 +212,6 @@ class WalletApi:
             return {"ok": False, "msg": str(e)}
 
     def _save_current_wallet(self, address, public_key, private_key=""):
-        """Compatibilidade: agora salva cifrado (.enc) + plaintext (.json) por segurança."""
         senha = _senha_carteira()
         ok_enc = False
         if senha:
@@ -220,7 +221,6 @@ class WalletApi:
             except Exception:
                 pass
 
-        # Mantem tambem o .json legado (alguns scripts antigos leem daqui)
         try:
             p = Path(__file__).parent / CURRENT_WALLET_JSON
             with open(p, "w", encoding="utf-8") as f:
@@ -384,11 +384,10 @@ class WalletApi:
         if not self.validate_address(addr):
             return {"ok": False, "msg": "Endereco invalido."}
         try:
-            # [v3.5] CORRIGIDO: server espera 'miner_pubkey' ou 'pubkey'
             payload = {
                 "validator_address": addr,
-                "miner_pubkey": pk or "",       # chave correta que o server le
-                "pubkey": pk or "",             # fallback
+                "miner_pubkey": pk or "",
+                "pubkey": pk or "",
             }
             r = requests.post(f"{API_URL}/api/mine", auth=AUTH,
                               json=payload, timeout=TIMEOUT_MINERACAO)
@@ -412,7 +411,7 @@ class WalletApi:
             payload = {
                 "address": addr,
                 "public_key": pk,
-                "miner_pubkey": pk,          # [v3.5] server le este
+                "miner_pubkey": pk,
                 "private_key": sk,
             }
             r = requests.post(f"{API_URL}/api/faucet", auth=AUTH,
@@ -432,24 +431,33 @@ class WalletApi:
     def start_mining(self, address, pubkey=""):
         """
         Inicia mineracao continua.
-        [v3.5] CORRIGIDO: envia 'miner_pubkey' (o que o server procura).
+        [v3.5.1] Timeout curto (30s) e timeout tratado como sucesso assumido.
         """
         try:
             payload = {
                 "validator_address": address,
-                "miner_pubkey": pubkey or "",   # chave principal
-                "pubkey": pubkey or "",         # fallback
-                "public_key": pubkey or "",     # fallback
+                "miner_pubkey": pubkey or "",
+                "pubkey": pubkey or "",
+                "public_key": pubkey or "",
             }
             r = requests.post(f"{API_URL}/api/miner/start",
-                              auth=AUTH, json=payload, timeout=TIMEOUT_MINERACAO)
+                              auth=AUTH, json=payload,
+                              timeout=TIMEOUT_MINER_START)
             if r.status_code != 200:
                 return _tratar_erro_http(r)
             return r.json()
         except requests.exceptions.ConnectionError:
             return {"ok": False, "msg": f"No offline em {API_URL}."}
         except requests.exceptions.Timeout:
-            return {"ok": False, "msg": "Timeout ao iniciar mineracao."}
+            # [v3.5.1] pode estar processando no servidor — assume iniciado
+            log.warning("start_mining: timeout ao aguardar resposta; "
+                        "assumindo que mineracao foi iniciada em background")
+            return {
+                "ok": True,
+                "assumed": True,
+                "msg": "Servidor demorou para responder, mas mineracao deve estar rodando. "
+                       "Verifique o status no painel do no.",
+            }
         except Exception as e:
             return {"ok": False, "msg": str(e)}
 
@@ -572,12 +580,13 @@ def main():
     api = WalletApi()
 
     log.info("=" * 60)
-    log.info("  BRN Wallet v3.5")
+    log.info("  BRN Wallet v3.5.1")
     log.info(f"  API_URL      : {API_URL}")
     log.info(f"  EXPLORER_URL : {EXPLORER_URL}")
     log.info(f"  HTML         : {index_path.name}")
     log.info(f"  Timeouts     : leitura={TIMEOUT_LEITURA}s "
-             f"tx={TIMEOUT_TX}s mina={TIMEOUT_MINERACAO}s")
+             f"tx={TIMEOUT_TX}s mina={TIMEOUT_MINERACAO}s "
+             f"inicio={TIMEOUT_MINER_START}s")
     senha = _senha_carteira()
     log.info(f"  Senha cart.  : {'definida' if senha else 'NAO DEFINIDA (carteira nao sera salva!)'}")
     log.info("=" * 60)
