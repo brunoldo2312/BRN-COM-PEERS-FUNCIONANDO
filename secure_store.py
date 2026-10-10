@@ -1,133 +1,88 @@
-# secure_store.py — BRN Chain v8.1
-# Criptografia: Argon2id + ChaCha20-Poly1305
-# Propósito: Armazenamento seguro de carteira e identidade de nó
+# secure_store.py — BRN Chain v8.2
+# Formato: BRNS | ver | salt(16) | nonce(12) | ciphertext || tag(16)
+from __future__ import annotations
 
 import os
 import json
-import base64
-from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
+import logging
+from pathlib import Path
+
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.exceptions import InvalidTag
 
+try:
+    from argon2.low_level import hash_secret_raw, Type
+    _ARGON2_IMPL = "cffi"
+except ImportError:
+    from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
+    _ARGON2_IMPL = "cryptography"
 
-# ⚙️ Configurações
-SALT_SIZE = 16
-KEY_SIZE = 32
+log = logging.getLogger("secure_store")
+
+SALT_SIZE  = 16
+KEY_SIZE   = 32
 NONCE_SIZE = 12
+TAG_SIZE   = 16
+MAGIC      = b"BRNS"
+FORMAT_VERSION = 1
 
-ARGON2_TIME_COST = 3
-ARGON2_MEMORY_COST = 65536  # 64 MiB
-ARGON2_PARALLELISM = 4
+ARGON2_TIME_COST   = int(os.environ.get("BRN_ARGON2_TIME", "3"))
+ARGON2_MEMORY_COST = int(os.environ.get("BRN_ARGON2_MEMORY", "65536"))
+ARGON2_PARALLELISM = int(os.environ.get("BRN_ARGON2_PARALLEL", "4"))
+MIN_PASSWORD_LEN = 8
 
 
 def _derive_key(password: str, salt: bytes) -> bytes:
-    """Deriva chave simétrica a partir da senha + salt usando Argon2id"""
-    kdf = Argon2id(
-        salt=salt,
-        time_cost=ARGON2_TIME_COST,
-        memory_cost=ARGON2_MEMORY_COST,
-        parallelism=ARGON2_PARALLELISM,
-        length=KEY_SIZE,
-    )
+    if _ARGON2_IMPL == "cffi":
+        return hash_secret_raw(
+            secret=password.encode("utf-8"), salt=salt,
+            time_cost=ARGON2_TIME_COST, memory_cost=ARGON2_MEMORY_COST,
+            parallelism=ARGON2_PARALLELISM, hash_len=KEY_SIZE, type=Type.ID,
+        )
+    kdf = Argon2id(salt=salt, length=KEY_SIZE,
+                   iterations=ARGON2_TIME_COST,
+                   lanes=ARGON2_PARALLELISM,
+                   memory_cost=ARGON2_MEMORY_COST)
     return kdf.derive(password.encode("utf-8"))
 
 
-def _encrypt(data: bytes, key: bytes) -> bytes:
-    """Cifra com ChaCha20-Poly1305 (inclui nonce + tag)"""
-    chacha = ChaCha20Poly1305(key)
+def _validate_password(password: str) -> None:
+    if not isinstance(password, str):
+        raise ValueError("senha deve ser string")
+    if len(password) < MIN_PASSWORD_LEN:
+        raise ValueError(f"senha muito curta (mínimo {MIN_PASSWORD_LEN} caracteres)")
+
+
+def _encrypt(data: bytes, key: bytes, aad: bytes = b"") -> bytes:
     nonce = os.urandom(NONCE_SIZE)
-    ciphertext = chacha.encrypt(nonce, data, None)
-    return nonce + ciphertext
+    return nonce + ChaCha20Poly1305(key).encrypt(nonce, data, aad)
 
 
-def _decrypt(packed_data: bytes, key: bytes) -> bytes:
-    """Decifra dados previamente cifrados"""
-    nonce = packed_data[:NONCE_SIZE]
-    ciphertext = packed_data[NONCE_SIZE:]
-    chacha = ChaCha20Poly1305(key)
-    return chacha.decrypt(nonce, ciphertext, None)
+def _decrypt(packed: bytes, key: bytes, aad: bytes = b"") -> bytes:
+    if len(packed) < NONCE_SIZE + TAG_SIZE:
+        raise ValueError("blob cifrado muito curto")
+    nonce, ct = packed[:NONCE_SIZE], packed[NONCE_SIZE:]
+    return ChaCha20Poly1305(key).decrypt(nonce, ct, aad)
 
 
-# ==========================================
-# ✅ FUNÇÃO CORRIGIDA — save_wallet
-# ==========================================
-def save_wallet(wallet_data: dict, password: str, path: str = "wallet_encrypted.dat") -> bool:
-    """
-    Cifra e persiste dados da carteira.
-    :param wallet_data: dicionário com mnemônico, chaves, endereços
-    :param password: senha do usuário
-    :param path: caminho do arquivo
-    """
-    salt = os.urandom(SALT_SIZE)
-    key = _derive_key(password, salt)
-
-    data_bytes = json.dumps(wallet_data, ensure_ascii=False).encode("utf-8")
-    encrypted = _encrypt(data_bytes, key)
-
-    with open(path, "wb") as f:
-        f.write(salt + encrypted)
-
-    os.chmod(path, 0o600)  # Leitura/Escrita APENAS para o dono
-    return True
-
-
-def load_wallet(password: str, path: str = "wallet_encrypted.dat") -> dict | None:
-    """Carrega e decifra a carteira salva"""
-    if not os.path.exists(path):
-        return None
-
-    with open(path, "rb") as f:
-        salt = f.read(SALT_SIZE)
-        encrypted = f.read()
-
-    key = _derive_key(password, salt)
-
+def _atomic_write(path: str, data: bytes, mode: int = 0o600) -> None:
+    p = Path(path)
+    tmp = p.with_name(f".{p.name}.tmp.{os.getpid()}")
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
     try:
-        decrypted = _decrypt(encrypted, key)
-        return json.loads(decrypted.decode("utf-8"))
-    except InvalidTag:
-        raise ValueError("Senha incorreta ou arquivo corrompido")
+        with os.fdopen(fd, "wb") as f:
+            f.write(data); f.flush(); os.fsync(f.fileno())
+        os.replace(str(tmp), path)
+        try:
+            dfd = os.open(str(p.parent) or ".", os.O_DIRECTORY)
+            try: os.fsync(dfd)
+            finally: os.close(dfd)
+        except OSError:
+            pass
+    except Exception:
+        try: tmp.unlink()
+        except FileNotFoundError: pass
+        raise
 
 
-# ==========================================
-# Identidade do Nó (node_identity.enc)
-# ==========================================
-def save_node_identity(identity_data: dict, password: str, path: str = "node_identity.enc") -> bool:
-    """Salva identidade Ed25519 do nó"""
-    salt = os.urandom(SALT_SIZE)
-    key = _derive_key(password, salt)
-
-    data_bytes = json.dumps(identity_data).encode("utf-8")
-    encrypted = _encrypt(data_bytes, key)
-
-    with open(path, "wb") as f:
-        f.write(salt + encrypted)
-
-    os.chmod(path, 0o600)
-    return True
-
-
-def load_node_identity(password: str, path: str = "node_identity.enc") -> dict | None:
-    """Carrega identidade do nó"""
-    if not os.path.exists(path):
-        return None
-
-    with open(path, "rb") as f:
-        salt = f.read(SALT_SIZE)
-        encrypted = f.read()
-
-    key = _derive_key(password, salt)
-
-    try:
-        decrypted = _decrypt(encrypted, key)
-        return json.loads(decrypted.decode("utf-8"))
-    except InvalidTag:
-        raise ValueError("Senha incorreta ou identidade corrompida")
-
-
-def delete_identity(path: str = "node_identity.enc") -> bool:
-    """Apaga identidade (usado para reiniciar com senha nova)"""
-    if os.path.exists(path):
-        os.remove(path)
-        return True
-    return False
+def _save_blob(path:
