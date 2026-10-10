@@ -85,4 +85,75 @@ def _atomic_write(path: str, data: bytes, mode: int = 0o600) -> None:
         raise
 
 
-def _save_blob(path:
+def _save_blob(path: str, data: dict, password: str, aad: bytes) -> bool:
+    _validate_password(password)
+    salt = os.urandom(SALT_SIZE)
+    key = _derive_key(password, salt)
+    pt = json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    blob = MAGIC + bytes([FORMAT_VERSION]) + salt + _encrypt(pt, key, aad)
+    _atomic_write(path, blob, mode=0o600)
+    return True
+
+
+def _load_blob(path: str, password: str, aad: bytes) -> dict | None:
+    p = Path(path)
+    if not p.exists():
+        return None
+    raw = p.read_bytes()
+    min_size = len(MAGIC) + 1 + SALT_SIZE + NONCE_SIZE + TAG_SIZE
+    if len(raw) < min_size:
+        raise ValueError(f"arquivo {path} truncado ({len(raw)} bytes)")
+    if raw[:4] != MAGIC:
+        raise ValueError(f"arquivo {path} não é um blob BRN")
+    version = raw[4]
+    if version != FORMAT_VERSION:
+        raise ValueError(f"versão de formato não suportada: {version}")
+    off = 5
+    salt = raw[off:off + SALT_SIZE]; off += SALT_SIZE
+    encrypted = raw[off:]
+    key = _derive_key(password, salt)
+    try:
+        decrypted = _decrypt(encrypted, key, aad)
+    except InvalidTag:
+        raise ValueError("Senha incorreta ou arquivo corrompido")
+    except Exception as e:
+        raise ValueError(f"Falha ao decifrar: {e}")
+    try:
+        return json.loads(decrypted.decode("utf-8"))
+    except Exception as e:
+        raise ValueError(f"Conteúdo inválido após decifrar: {e}")
+
+
+def save_wallet(wallet_data: dict, password: str,
+                path: str = "wallet_encrypted.dat") -> bool:
+    return _save_blob(path, wallet_data, password, aad=b"wallet")
+
+
+def load_wallet(password: str,
+                path: str = "wallet_encrypted.dat") -> dict | None:
+    return _load_blob(path, password, aad=b"wallet")
+
+
+def save_node_identity(identity_data: dict, password: str,
+                       path: str = "node_identity.enc") -> bool:
+    return _save_blob(path, identity_data, password, aad=b"node_identity")
+
+
+def load_node_identity(password: str,
+                       path: str = "node_identity.enc") -> dict | None:
+    return _load_blob(path, password, aad=b"node_identity")
+
+
+def delete_identity(path: str = "node_identity.enc", secure: bool = True) -> bool:
+    p = Path(path)
+    if not p.exists():
+        return False
+    if secure:
+        try:
+            size = p.stat().st_size
+            with p.open("r+b") as f:
+                f.write(os.urandom(size)); f.flush(); os.fsync(f.fileno())
+        except Exception as e:
+            log.warning(f"overwrite de {path} falhou: {e}")
+    p.unlink()
+    return True
