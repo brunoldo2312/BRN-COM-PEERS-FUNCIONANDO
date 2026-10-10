@@ -17,6 +17,7 @@ v11 (correções e adições):
   [FIX] Status loop loga erros (não engole)
   [FIX] Miner wallet em miner_wallet.enc via secure_store
   [FIX] SIGHUP tratado
+  [FIX] F-strings com aspas aninhadas removidas (compat. editores)
   [NEW] threading.excepthook + _thread_wrap
   [NEW] _check_required_modules() no boot
   [NEW] Rendezvous discovery integrado (p2p.add_peer)
@@ -60,7 +61,7 @@ def _bootstrap_env() -> None:
             if k and k not in os.environ:
                 os.environ[k] = v
     except Exception as e:
-        print(f"[boot] aviso: falha lendo {env_file}: {e}")
+        print("[boot] aviso: falha lendo " + str(env_file) + ": " + str(e))
 
 
 _bootstrap_env()
@@ -101,9 +102,9 @@ def _register_service(name: str, svc) -> None:
 def _thread_excepthook(args):
     try:
         log = get_logger("thread")
+        thread_name = args.thread.name if args.thread else "?"
         log.error(
-            f"Thread '{args.thread.name if args.thread else '?'}' morreu: "
-            f"{args.exc_value}",
+            "Thread '" + str(thread_name) + "' morreu: " + str(args.exc_value),
             exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
         )
     except Exception:
@@ -119,7 +120,7 @@ def _thread_wrap(name: str, fn):
             fn()
         except Exception as e:
             try:
-                get_logger(name).exception(f"thread {name} caiu: {e}")
+                get_logger(name).exception("thread " + name + " caiu: " + str(e))
             except Exception:
                 pass
     return runner
@@ -128,7 +129,7 @@ def _thread_wrap(name: str, fn):
 # ============================================================
 # CHECAGEM DE MÓDULOS OBRIGATÓRIOS
 # ============================================================
-def _check_required_modules() -> list[str]:
+def _check_required_modules() -> list:
     required = [
         "brn_config", "brn_logger", "version",
         "blockchain", "db", "crypto", "wallet",
@@ -158,7 +159,7 @@ try:
     L2_ENABLED = True
     print("[L2] Módulos BTC carregados OK")
 except Exception as _e:
-    print(f"[AVISO] btc_watcher/l2_manager indisponível: {_e}")
+    print("[AVISO] btc_watcher/l2_manager indisponível: " + str(_e))
     print("[AVISO] Ponte BTC e L2 DESATIVADAS — o nó continua normal.")
 
 
@@ -170,7 +171,7 @@ def _l2_disponivel() -> bool:
 # ============================================================
 # AUDIT
 # ============================================================
-def _audit(event: str, data: dict | None = None) -> None:
+def _audit(event: str, data: dict = None) -> None:
     try:
         from security import audit_log
         audit_log(event, data or {})
@@ -191,7 +192,6 @@ def _close_audit() -> None:
 # ============================================================
 def parse_args():
     p = argparse.ArgumentParser(prog="main.py", description="BRN Node v11")
-    # diagnósticos
     p.add_argument("--status", action="store_true")
     p.add_argument("--headless", action="store_true")
     p.add_argument("--read-only", action="store_true")
@@ -206,18 +206,14 @@ def parse_args():
     p.add_argument("--rotate-node-id", action="store_true")
     p.add_argument("--client-mode", action="store_true")
     p.add_argument("--discover", action="store_true")
-    # L2
     p.add_argument("--l2", action="store_true")
     p.add_argument("--l2-stats", action="store_true")
-    # mineração
     p.add_argument("--mine", action="store_true")
-    # P2P
     p.add_argument("--no-p2p", action="store_true")
     p.add_argument("--relay", dest="relay", action="store_true", default=None,
                    help="Força relay ligado")
     p.add_argument("--no-relay", dest="relay", action="store_false",
                    help="Força relay desligado")
-    # verify
     p.add_argument("--verify-only", action="store_true")
     p.add_argument("--skip-verify", action="store_true")
     return p.parse_args()
@@ -230,7 +226,7 @@ def _resolve_password(args) -> str:
     if args.password_file:
         p = Path(args.password_file)
         if not p.exists():
-            raise SystemExit(f"--password-file não encontrado: {p}")
+            raise SystemExit("--password-file não encontrado: " + str(p))
         return p.read_text(encoding="utf-8").rstrip("\r\n")
     if args.password:
         raise SystemExit(
@@ -259,12 +255,12 @@ def load_or_create_node_identity(password: str, rotate: bool = False):
     if rotate and NODE_ID_PATH.exists():
         backup = NODE_ID_PATH.with_suffix(".enc.bak")
         NODE_ID_PATH.replace(backup)
-        log.warning(f"Identidade rotacionada. Backup em {backup}")
+        log.warning("Identidade rotacionada. Backup em " + str(backup))
 
     if NODE_ID_PATH.exists():
         data = load_wallet(password, str(NODE_ID_PATH))
         if not data:
-            raise SystemExit(f"Falha ao decifrar {NODE_ID_PATH}")
+            raise SystemExit("Falha ao decifrar " + str(NODE_ID_PATH))
         sk = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(data["sk"]))
         return sk, data["pub"]
 
@@ -274,7 +270,7 @@ def load_or_create_node_identity(password: str, rotate: bool = False):
         {"sk": sk.private_bytes_raw().hex(), "pub": pub_hex},
         password, str(NODE_ID_PATH),
     )
-    log.info(f"Identidade nova criada: {pub_hex[:16]}... ({NODE_ID_PATH})")
+    log.info("Identidade nova criada: " + pub_hex[:16] + "... (" + str(NODE_ID_PATH) + ")")
     return sk, pub_hex
 
 
@@ -320,20 +316,21 @@ def _verify_chain(chain) -> str:
     try:
         r = verify_chain(chain)
     except Exception as e:
-        log.exception(f"validador falhou: {e}")
+        log.exception("validador falhou: " + str(e))
         return VERIFY_ERROR
 
     dt = time.time() - t0
     if r.valid:
-        log.info(f"✓ {r.summary()} ({dt:.2f}s, {r.blocks_checked} blocos, "
-                 f"{r.checkpoints_checked} checkpoints)")
+        log.info("OK " + r.summary() + " (" + str(round(dt, 2)) + "s, "
+                 + str(r.blocks_checked) + " blocos, "
+                 + str(r.checkpoints_checked) + " checkpoints)")
         for w in (r.warnings or [])[:5]:
-            log.warning(f"  {w}")
+            log.warning("  " + str(w))
         return VERIFY_OK
 
-    log.error(f"✗ CADEIA INVÁLIDA ({len(r.errors)} erros)")
+    log.error("CADEIA INVÁLIDA (" + str(len(r.errors)) + " erros)")
     for e in (r.errors or [])[:10]:
-        log.error(f"  - {e}")
+        log.error("  - " + str(e))
     return VERIFY_INVALID
 
 
@@ -348,8 +345,8 @@ def _parse_version(s):
 
 
 def check_for_update(timeout: int = 5):
-    url = (f"https://raw.githubusercontent.com/"
-           f"{GITHUB_USER}/{GITHUB_REPO}/main/version.json")
+    url = ("https://raw.githubusercontent.com/"
+           + GITHUB_USER + "/" + GITHUB_REPO + "/main/version.json")
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "brn-node"})
         with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -369,27 +366,28 @@ def check_for_update(timeout: int = 5):
 # ============================================================
 def do_status(cfg):
     print("=" * 64)
-    print(f" BRN Node — Diagnóstico (v{VERSION})")
+    print(" BRN Node — Diagnóstico (v" + VERSION + ")")
     print("=" * 64)
-    print(f" Versão : {VERSION} ({BUILD_DATE})")
-    print(f" Config : {cfg.source}")
-    print(f" Web    : {WEB_HOST}:{cfg['web_port']}")
-    print(f" Expl.  : {EXPLORER_HOST}:{cfg['explorer_port']}")
-    print(f" P2P    : {cfg['p2p_port']}")
+    print(" Versão : " + VERSION + " (" + BUILD_DATE + ")")
+    print(" Config : " + cfg.source)
+    print(" Web    : " + WEB_HOST + ":" + str(cfg["web_port"]))
+    print(" Expl.  : " + EXPLORER_HOST + ":" + str(cfg["explorer_port"]))
+    print(" P2P    : " + str(cfg["p2p_port"]))
     print()
+
     https = os.environ.get("BRN_HTTPS", "0") == "1"
     audit = os.environ.get("BRN_AUDIT_ENABLED", "1") == "1"
     rdv   = os.environ.get("BRN_RENDEZVOUS_URL", "").strip()
-    print(f" HTTPS       : {'SIM' if https else 'não'}")
-    print(f"   Audit log   : {'SIM' : if audit else 'não'}")
-    print(f" Rendezvous {  : {rdv or '(nhão configurado)'}")
-    print(f"}")
- Auto-mine   : {'SIM' if AUTO_M           INE else 'não'}")
+
+    print(" HTTPS       : " + ("SIM" if https else "não"))
+    print(" Audit log   : " + ("SIM" if audit else "não"))
+    print(" Rendezvous  : " + (rdv if rdv else "(não configurado)"))
+    print(" Auto-mine   : " + ("SIM" if AUTO_MINE else "não"))
     print()
 
     missing = _check_required_modules()
     if missing:
-        print(f" ⚠️  Módulos faltando: {', '.join(missing)}")
+        print(" [!] Módulos faltando: " + ", ".join(missing))
     else:
         print(" Módulos     : OK")
     print()
@@ -397,38 +395,45 @@ def do_status(cfg):
     if _l2_disponivel():
         try:
             print(" L2 Enabled  : SIM")
-            print(f" BTC Addr    : {getattr(btc_config, 'BTC_RECEIVE_ADDRESS', '?')}")
+            print(" BTC Addr    : " + str(getattr(btc_config, "BTC_RECEIVE_ADDRESS", "?")))
         except Exception as e:
-            print(f" L2 Enabled  : SIM (erro: {e})")
+            print(" L2 Enabled  : SIM (erro: " + str(e) + ")")
     else:
         print(" L2 Enabled  : NÃO")
 
     try:
         from checkpoints import load_checkpoints
         cps = load_checkpoints()
-        print(f" Checkpoints : {len(cps)} carregados")
+        print(" Checkpoints : " + str(len(cps)) + " carregados")
     except Exception as e:
-        print(f" Checkpoints : indisponível ({e})")
+        print(" Checkpoints : indisponível (" + str(e) + ")")
 
-    print(f" Role (auto) : {'ORIGEM' if _is_origin(False) else 'CLIENTE'}")
+    origin = _is_origin(False)
+    print(" Role (auto) : " + ("ORIGEM" if origin else "CLIENTE"))
 
     db_path = cfg["db_path"]
-    print(f" DB path     : {db_path}")
+    print(" DB path     : " + str(db_path))
     if os.path.exists(db_path):
-        print(f" DB size     : {os.path.getsize(db_path)/1024:.1f} KB")
+        size_kb = os.path.getsize(db_path) / 1024
+        print(" DB size     : " + str(round(size_kb, 1)) + " KB")
         try:
             import sqlite3
             conn = sqlite3.connect(db_path)
-            h = conn.execute("SELECT MAX(height) FROM blocks").fetchone()[0]
-            print(f" DB height conn.close()
+            row = conn.execute("SELECT MAX(height) FROM blocks").fetchone()
+            h = row[0] if row else None
+            print(" DB height   : " + str(h))
+            conn.close()
         except Exception as e:
-            print(f" DB height   : erro ({e})")
+            print(" DB height   : erro (" + str(e) + ")")
 
     # Mongo health (best-effort)
     try:
         from mongo_client import mongo
         ok, err = mongo.ping()
-        print(f" MongoDB     : {'OK' if ok else f'off ({err or \"não configurado\"})'}")
+        if ok:
+            print(" MongoDB     : OK")
+        else:
+            print(" MongoDB     : off (" + (err if err else "não configurado") + ")")
     except Exception:
         print(" MongoDB     : pymongo indisponível")
 
@@ -442,15 +447,17 @@ def _do_discover_diagnostic(cfg):
     try:
         from discovery_v2 import UDPDiscovery, get_all_local_ips
     except ImportError as e:
-        print(f" discovery_v2 indisponível: {e}")
+        print(" discovery_v2 indisponível: " + str(e))
         return
-    print(f"\n IPs locais: {get_all_local_ips()}")
-    print("\n Escutando 15s...")
+    print()
+    print(" IPs locais: " + str(get_all_local_ips()))
+    print()
+    print(" Escutando 15s...")
     found = []
 
     def on_peer(ip, port):
-        found.append(f"{ip}:{port}")
-        print(f" [achou] {ip}:{port}")
+        found.append(ip + ":" + str(port))
+        print(" [achou] " + ip + ":" + str(port))
 
     stop = [False]
     try:
@@ -460,8 +467,9 @@ def _do_discover_diagnostic(cfg):
         stop[0] = True
         udp.stop()
     except Exception as e:
-        print(f" falha: {e}")
-    print(f"\n Resultado: {len(found)} peer(s)")
+        print(" falha: " + str(e))
+    print()
+    print(" Resultado: " + str(len(found)) + " peer(s)")
     print("=" * 64)
 
 
@@ -469,7 +477,6 @@ def _do_discover_diagnostic(cfg):
 # THREADS DE SERVIÇO
 # ============================================================
 def run_http():
-    """server.py — backend da carteira (endpoints destrutivos)."""
     from server import app as http_app
     log = get_logger("http")
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
@@ -479,12 +486,12 @@ def run_http():
             from security import ensure_self_signed_cert
             cert, key = ensure_self_signed_cert()
             ssl_ctx = (cert, key)
-            log.info(f"HTTPS https://{WEB_HOST}:{port}")
+            log.info("HTTPS https://" + WEB_HOST + ":" + str(port))
         except Exception as e:
-            log.warning(f"Falha ao gerar cert HTTPS: {e}. Caindo para HTTP.")
+            log.warning("Falha ao gerar cert HTTPS: " + str(e) + ". Caindo para HTTP.")
             ssl_ctx = None
     if ssl_ctx is None:
-        log.info(f"HTTP http://{WEB_HOST}:{port}")
+        log.info("HTTP http://" + WEB_HOST + ":" + str(port))
     http_app.run(
         host=WEB_HOST, port=port, threaded=True,
         debug=False, use_reloader=False, ssl_context=ssl_ctx,
@@ -492,7 +499,6 @@ def run_http():
 
 
 def run_explorer():
-    """explorer.py — API pública de consulta."""
     from explorer import app as explorer_app
     log = get_logger("explorer")
     port = int(os.environ.get("BRN_EXPLORER_PORT", "8080"))
@@ -503,8 +509,8 @@ def run_explorer():
             ssl_ctx = ensure_self_signed_cert()
         except Exception:
             ssl_ctx = None
-    log.info(f"Explorer {'https' if ssl_ctx else 'http'}://"
-             f"{EXPLORER_HOST}:{port}")
+    proto = "https" if ssl_ctx else "http"
+    log.info("Explorer " + proto + "://" + EXPLORER_HOST + ":" + str(port))
     explorer_app.run(
         host=EXPLORER_HOST, port=port, threaded=True,
         debug=False, use_reloader=False, ssl_context=ssl_ctx,
@@ -516,7 +522,6 @@ def run_status_loop(chain, p2p, l2_manager=None):
     if p2p is None:
         log.warning("P2P desabilitado — status loop sem peers")
 
-    # Mongo: pega handle uma vez
     mongo = None
     try:
         from mongo_client import mongo as _m
@@ -537,34 +542,36 @@ def run_status_loop(chain, p2p, l2_manager=None):
                     if relay:
                         relay_routes = len(relay.routes)
                 except Exception as e:
-                    log.warning(f"p2p.get_status: {e}")
+                    log.warning("p2p.get_status: " + str(e))
 
-            msg = (f"Altura={chain.db.height()} "
-                   f"Peers={peer_count} "
-                   f"Relay={relay_routes} "
-                   f"Mempool={len(chain.db.all_mempool(limit=1000))} "
-                   f"UTXOs={chain.db.count_utxos()}")
+            mempool_n = len(chain.db.all_mempool(limit=1000))
+            utxos_n = chain.db.count_utxos()
+
+            msg = ("Altura=" + str(chain.db.height())
+                   + " Peers=" + str(peer_count)
+                   + " Relay=" + str(relay_routes)
+                   + " Mempool=" + str(mempool_n)
+                   + " UTXOs=" + str(utxos_n))
 
             if l2_manager is not None:
                 try:
                     s = l2_manager.stats()
-                    msg += (f" L2[OPEN={s.get('open', 0)} "
-                            f"DETECTED={s.get('btc_detected', 0)} "
-                            f"RELEASED={s.get('released', 0)}]")
+                    msg += (" L2[OPEN=" + str(s.get("open", 0))
+                            + " DETECTED=" + str(s.get("btc_detected", 0))
+                            + " RELEASED=" + str(s.get("released", 0)) + "]")
                 except Exception:
                     pass
 
             if mongo is not None and mongo.uri:
                 ok, err = mongo.ping()
-                msg += f" Mongo={'OK' if ok else 'off'}"
+                msg += " Mongo=" + ("OK" if ok else "off")
 
             log.info(msg)
         except Exception as e:
-            log.warning(f"status loop: {e}")
+            log.warning("status loop: " + str(e))
 
 
 def run_wallet_main_thread():
-    """UI nativa (pywebview) — só roda em modo GUI."""
     try:
         if not os.environ.get("BRN_WEB_PASS"):
             get_logger("wallet").error("BRN_WEB_PASS não definida")
@@ -574,7 +581,7 @@ def run_wallet_main_thread():
         log = get_logger("wallet")
         index_path = BASE_DIR / "index_wallet.html"
         if not index_path.exists():
-            log.error(f"index_wallet.html não encontrado: {index_path}")
+            log.error("index_wallet.html não encontrado: " + str(index_path))
             return
         api = WalletApi()
         webview.create_window(
@@ -587,14 +594,13 @@ def run_wallet_main_thread():
         )
         webview.start(debug=False)
     except Exception as e:
-        get_logger("wallet").error(f"Falha: {e}")
+        get_logger("wallet").error("Falha: " + str(e))
 
 
 # ============================================================
 # RELAY SETUP
 # ============================================================
 def _setup_relay(p2p, node_id_priv, enabled):
-    """Integra p2p_relay se: (a) habilitado, (b) módulos disponíveis."""
     if enabled is False:
         return None
     if p2p is None:
@@ -603,13 +609,13 @@ def _setup_relay(p2p, node_id_priv, enabled):
     try:
         from p2p_relay import RelayManager
     except ImportError as e:
-        get_logger("relay").info(f"p2p_relay indisponível: {e}")
+        get_logger("relay").info("p2p_relay indisponível: " + str(e))
         return None
 
     try:
         relay = RelayManager(p2p, node_id_priv)
     except Exception as e:
-        get_logger("relay").warning(f"RelayManager falhou: {e}")
+        get_logger("relay").warning("RelayManager falhou: " + str(e))
         return None
 
     srv = getattr(p2p, "server", None)
@@ -665,11 +671,11 @@ def _stop_with_timeout(name: str, svc, timeout: float = 5.0, log=None) -> None:
     except Exception:
         return
 
-    t = threading.Thread(target=fn, daemon=True, name=f"stop-{name}")
+    t = threading.Thread(target=fn, daemon=True, name="stop-" + name)
     t.start()
     t.join(timeout)
     if t.is_alive() and log is not None:
-        log.warning(f"Serviço {name} não parou em {timeout}s")
+        log.warning("Serviço " + name + " não parou em " + str(timeout) + "s")
 
 
 def _graceful_shutdown(log) -> None:
@@ -681,14 +687,12 @@ def _graceful_shutdown(log) -> None:
     for name, svc in reversed(services):
         _stop_with_timeout(name, svc, timeout=5.0, log=log)
 
-    # Tranca a sessão da carteira
     try:
         from wallet import WalletManager
         WalletManager.lock_session()
     except Exception:
         pass
 
-    # Fecha Mongo
     try:
         from mongo_client import mongo
         mongo.close()
@@ -706,10 +710,14 @@ def main():
     args = parse_args()
     cfg = Config(args.config)
 
-    if args.read_only: cfg.data["read_only"] = True
-    if args.headless:  cfg.data["headless"]  = True
-    if args.log_level: cfg.data["log_level"] = args.log_level
-    if args.log_file:  cfg.data["log_file"]  = args.log_file
+    if args.read_only:
+        cfg.data["read_only"] = True
+    if args.headless:
+        cfg.data["headless"] = True
+    if args.log_level:
+        cfg.data["log_level"] = args.log_level
+    if args.log_file:
+        cfg.data["log_file"] = args.log_file
     cfg.apply_to_env()
 
     log = setup_logger(level=cfg["log_level"],
@@ -718,40 +726,50 @@ def main():
     is_origin = _is_origin(args.client_mode)
 
     log.info("=" * 60)
-    log.info(f" BRN Node v{VERSION} ({BUILD_DATE})")
-    l2_mode = "ON" if (args.l2 and _l2_disponivel()) else (
-              "off" if not args.l2 else "INDISPONÍVEL")
-    log.info(f" Config: {cfg.source} | "
-             f"Modo: {'ORIGEM' if is_origin else 'CLIENTE'} | L2: {l2_mode}")
-    log.info(f" HTTPS: {'ON' if os.environ.get('BRN_HTTPS') == '1' else 'off'} | "
-             f"Rendezvous: {os.environ.get('BRN_RENDEZVOUS_URL', '—')} | "
-             f"Auto-mine: {'ON' if AUTO_MINE else 'off'}")
+    log.info(" BRN Node v" + VERSION + " (" + BUILD_DATE + ")")
+    if args.l2 and _l2_disponivel():
+        l2_mode = "ON"
+    elif not args.l2:
+        l2_mode = "off"
+    else:
+        l2_mode = "INDISPONÍVEL"
+    log.info(" Config: " + cfg.source
+             + " | Modo: " + ("ORIGEM" if is_origin else "CLIENTE")
+             + " | L2: " + l2_mode)
+    log.info(" HTTPS: " + ("ON" if os.environ.get("BRN_HTTPS") == "1" else "off")
+             + " | Rendezvous: " + os.environ.get("BRN_RENDEZVOUS_URL", "—")
+             + " | Auto-mine: " + ("ON" if AUTO_MINE else "off"))
     log.info("=" * 60)
 
     # ---- comandos que saem sozinhos ----
     if args.version:
-        print(VERSION); return 0
+        print(VERSION)
+        return 0
     if args.status:
-        do_status(cfg); return 0
+        do_status(cfg)
+        return 0
     if args.discover:
-        _do_discover_diagnostic(cfg); return 0
+        _do_discover_diagnostic(cfg)
+        return 0
     if args.check_update:
-        print(check_for_update()); return 0
+        print(check_for_update())
+        return 0
     if args.l2_stats:
         if not _l2_disponivel():
-            print("L2 não disponível"); return 0
+            print("L2 não disponível")
+            return 0
         try:
             from db import ChainDB
             db = ChainDB(cfg["db_path"])
             print(json.dumps(L2Manager(db).stats(), indent=2))
         except Exception as e:
-            print(f"Erro: {e}")
+            print("Erro: " + str(e))
         return 0
 
     # ---- módulos obrigatórios ----
     missing = _check_required_modules()
     if missing:
-        log.error(f"Módulos obrigatórios faltando: {', '.join(missing)}")
+        log.error("Módulos obrigatórios faltando: " + ", ".join(missing))
         return 1
 
     # ---- identidade ----
@@ -761,12 +779,12 @@ def main():
             node_password, rotate=args.rotate_node_id)
     except SystemExit:
         raise
-    log.info(f"Nó ID: {node_id_pub}")
+    log.info("Nó ID: " + node_id_pub)
 
     # ---- blockchain ----
     from blockchain import Blockchain
     chain = Blockchain(cfg["db_path"], auto_genesis=not args.client_mode)
-    log.info(f"Altura atual: {chain.db.height()}")
+    log.info("Altura atual: " + str(chain.db.height()))
 
     # ---- checkpoints ----
     try:
@@ -776,17 +794,19 @@ def main():
         set_checkpoints(cps)
         if is_origin and node_id_priv is not None:
             set_checkpoint_priv(node_id_priv)
-            log.info(f"Checkpoints: {len(cps)} carregados (assinatura ATIVA)")
+            log.info("Checkpoints: " + str(len(cps)) + " carregados (assinatura ATIVA)")
         else:
-            log.info(f"Checkpoints: {len(cps)} carregados (só valida)")
+            log.info("Checkpoints: " + str(len(cps)) + " carregados (só valida)")
     except Exception as e:
-        log.warning(f"Checkpoints desativados: {e}")
+        log.warning("Checkpoints desativados: " + str(e))
 
     # ---- verify ----
     if args.verify_only:
         st = _verify_chain(chain)
-        try: chain.db.close()
-        except Exception: pass
+        try:
+            chain.db.close()
+        except Exception:
+            pass
         return 0 if st == VERIFY_OK else 2
 
     if not args.skip_verify and os.environ.get("BRN_SKIP_VERIFY", "0") != "1":
@@ -794,8 +814,10 @@ def main():
         st = _verify_chain(chain)
         if st == VERIFY_INVALID and strict:
             log.error("Abortando boot: cadeia inválida (BRN_VERIFY_STRICT=1)")
-            try: chain.db.close()
-            except Exception: pass
+            try:
+                chain.db.close()
+            except Exception:
+                pass
             return 2
         if st == VERIFY_ERROR:
             log.warning("Verificação não conclusiva — seguindo com cautela")
@@ -812,7 +834,7 @@ def main():
             _register_service("p2p", p2p)
             log.info("P2P iniciado")
         except Exception as e:
-            log.error(f"Falha ao iniciar P2P: {e}")
+            log.error("Falha ao iniciar P2P: " + str(e))
             p2p = None
 
     # ---- Relay ----
@@ -842,9 +864,9 @@ def main():
             )
             rdv.start()
             _register_service("rendezvous", rdv)
-            log.info(f"Rendezvous → {rdv_url}")
+            log.info("Rendezvous -> " + rdv_url)
         except Exception as e:
-            log.warning(f"Rendezvous falhou: {e}")
+            log.warning("Rendezvous falhou: " + str(e))
 
     # ---- L2 ----
     l2_manager = None
@@ -857,7 +879,7 @@ def main():
             l2_ativo = True
             log.info("L2Manager carregado")
         except Exception as e:
-            log.warning(f"L2Manager falhou: {e}")
+            log.warning("L2Manager falhou: " + str(e))
 
     if args.l2 and l2_ativo:
         try:
@@ -868,9 +890,9 @@ def main():
                 btc_watcher = BTCWatcher(chain.db, chain)
                 btc_watcher.start()
                 _register_service("btc_watcher", btc_watcher)
-                log.info(f"L2 Watcher RPC iniciado em {btc_addr}")
+                log.info("L2 Watcher RPC iniciado em " + btc_addr)
         except Exception as e:
-            log.warning(f"Falha ao iniciar BTCWatcher: {e}")
+            log.warning("Falha ao iniciar BTCWatcher: " + str(e))
             btc_watcher = None
     elif args.l2:
         log.warning("--l2 solicitado, mas L2 não disponível. Ignorando.")
@@ -905,17 +927,17 @@ def main():
                     if hasattr(mw, "to_dict"):
                         save_wallet(mw.to_dict(), node_password,
                                     str(miner_wallet_path))
-                        log.info(f"Miner wallet criada em {miner_wallet_path}")
+                        log.info("Miner wallet criada em " + str(miner_wallet_path))
                     else:
                         log.warning("Wallet sem to_dict() — não salvei (inseguro)")
                 except Exception as e:
-                    log.warning(f"Falha ao salvar miner wallet: {e}")
+                    log.warning("Falha ao salvar miner wallet: " + str(e))
 
             miner.start(mw.address, mw.pubkey_hex)
             _register_service("miner", miner)
-            log.info(f"Miner iniciado com {mw.address}")
+            log.info("Miner iniciado com " + mw.address)
         except Exception as e:
-            log.warning(f"Miner falhou: {e}")
+            log.warning("Miner falhou: " + str(e))
 
     # ---- Status loop ----
     threading.Thread(
@@ -928,7 +950,7 @@ def main():
 
     # ---- Cliente aguarda genesis ----
     if args.client_mode and chain.db.height() < 0:
-        log.info(f"Aguardando genesis (timeout {CLIENT_BOOT_TIMEOUT}s)...")
+        log.info("Aguardando genesis (timeout " + str(CLIENT_BOOT_TIMEOUT) + "s)...")
         t0 = time.time()
         while chain.db.height() < 0 and (time.time() - t0) < CLIENT_BOOT_TIMEOUT:
             if _shutdown.is_set():
@@ -969,7 +991,6 @@ def main():
     except Exception:
         pass
 
-    # best-effort: limpa senha
     try:
         del node_password
     except Exception:
@@ -1006,11 +1027,11 @@ if __name__ == "__main__":
     except Exception as e:
         try:
             log = get_logger("main")
-            log.exception(f"Erro fatal: {e}")
+            log.exception("Erro fatal: " + str(e))
             try:
                 _graceful_shutdown(log)
             except Exception:
                 pass
         except Exception:
-            print(f"Erro fatal: {e}", file=sys.stderr)
+            print("Erro fatal: " + str(e), file=sys.stderr)
         sys.exit(1)
