@@ -84,6 +84,7 @@
   .btn.p:hover { background:#2ea043; }
   .btn.danger { background:#8b2424; border-color:#a52a2a; color:#fff; }
   .btn.danger:hover { background:#a52a2a; }
+  .btn.big { font-size:1rem; padding:12px 24px; font-weight:600; }
 
   .addr { display:block; padding:8px 10px; margin-top:6px;
           background:#0d1117; border:1px solid #21262d; border-radius:6px;
@@ -96,6 +97,7 @@
   .msg.ok   { background:#0d2818; border:1px solid #238636; color:#7ee787; }
   .msg.err  { background:#2d1416; border:1px solid #8b2424; color:#ffa198; }
   .msg.info { background:#0d1d2f; border:1px solid #1f6feb; color:#79c0ff; }
+  .msg.warn { background:#2d2200; border:1px solid #9e6a03; color:#e3b341; }
 
   table { width:100%; border-collapse:collapse; font-size:.82rem; }
   th, td { padding:7px 8px; text-align:left; border-bottom:1px solid #21262d; }
@@ -126,6 +128,72 @@
   .badge.self     { background:#2d2200; color:#e3b341; border:1px solid #9e6a03; }
   .badge.pending  { background:#2d2200; color:#e3b341; border:1px solid #9e6a03; }
   .badge.confirmed{ background:#0d2818; color:#7ee787; border:1px solid #238636; }
+
+  /* ============ Card de Sincronização ============ */
+  .sync-card {
+    background: linear-gradient(135deg, #0d1d2f 0%, #161b22 100%);
+    border: 2px solid #1f6feb;
+    border-radius: 8px;
+    padding: 18px;
+    margin-bottom: 14px;
+  }
+  .sync-card h2 {
+    font-size: .9rem; color: #58a6ff; text-transform: uppercase;
+    letter-spacing: .05em; margin-bottom: 14px;
+  }
+  .sync-actions { display: flex; gap: 10px; flex-wrap: wrap; }
+  .sync-progress {
+    margin-top: 16px;
+    display: none;
+  }
+  .sync-progress.show { display: block; }
+  .sync-stats {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px;
+  }
+  .sync-stat {
+    background: #0d1117; border: 1px solid #21262d;
+    border-radius: 6px; padding: 10px 12px;
+  }
+  .sync-stat .lbl { font-size: .7rem; color: #8b949e; text-transform: uppercase; }
+  .sync-stat .val { font-size: 1.15rem; font-weight: 600;
+                    color: #58a6ff; margin-top: 2px; }
+  .sync-bar-big {
+    margin-top: 16px; height: 18px;
+    background: #21262d; border-radius: 9px; overflow: hidden;
+  }
+  .sync-bar-big > div {
+    height: 100%; width: 0%; background: #58a6ff;
+    transition: width .4s, background .4s;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .sync-status-line {
+    text-align: center; margin-top: 10px;
+    font-size: .9rem; color: #8b949e;
+  }
+  .sync-status-line b { color: #58a6ff; }
+
+  .sync-badge-ok {
+    display: none;
+    margin-top: 16px; padding: 20px;
+    background: linear-gradient(135deg, #0d2818 0%, #0d1d0f 100%);
+    border: 3px solid #238636;
+    border-radius: 10px; text-align: center;
+    animation: badgeAppear .6s ease-out;
+  }
+  .sync-badge-ok.show { display: block; }
+  @keyframes badgeAppear {
+    0% { opacity: 0; transform: scale(0.9); }
+    100% { opacity: 1; transform: scale(1); }
+  }
+  .sync-badge-ok .icon { font-size: 2.5rem; }
+  .sync-badge-ok .title {
+    color: #7ee787; font-size: 1.3rem;
+    font-weight: 700; margin-top: 8px;
+    letter-spacing: .05em;
+  }
+  .sync-badge-ok .info {
+    color: #8b949e; font-size: .85rem; margin-top: 8px;
+  }
 </style>
 </head>
 <body>
@@ -169,6 +237,50 @@
 
   <!-- ============ EXPLORADOR ============ -->
   <div class="panel active" id="p-explorer">
+
+    <div class="sync-card">
+      <h2>🔄 Sincronização da Blockchain</h2>
+
+      <div class="sync-actions">
+        <button class="btn" id="bSyncCheck">🔍 Verificar Conexão</button>
+        <button class="btn p big" id="bSyncStart">▶️ Iniciar Sincronização</button>
+        <button class="btn danger" id="bSyncStop" style="display:none;">⏹️ Parar</button>
+      </div>
+
+      <div class="msg" id="mSync"></div>
+
+      <div class="sync-progress" id="syncProgress">
+        <div class="sync-stats">
+          <div class="sync-stat">
+            <div class="lbl">Blocos baixados</div>
+            <div class="val" id="syncHeight">0</div>
+          </div>
+          <div class="sync-stat">
+            <div class="lbl">Alvo (peer)</div>
+            <div class="val" id="syncTarget">0</div>
+          </div>
+          <div class="sync-stat">
+            <div class="lbl">Peers</div>
+            <div class="val" id="syncPeers">0</div>
+          </div>
+        </div>
+
+        <div class="sync-bar-big">
+          <div id="syncProgressBar"></div>
+        </div>
+        <div class="sync-status-line">
+          <b id="syncPercent">0%</b>
+          <span id="syncStatusText" style="margin-left:10px;">—</span>
+        </div>
+
+        <div class="sync-badge-ok" id="syncBadgeOk">
+          <div class="icon">✅</div>
+          <div class="title">BLOCKCHAIN SINCRONIZADA</div>
+          <div class="info" id="syncCompleteInfo">—</div>
+        </div>
+      </div>
+    </div>
+
     <div class="card">
       <h2>Estado do nó</h2>
       <div class="grid3">
@@ -308,8 +420,7 @@
     <div class="card">
       <h2>🔎 Verificar se uma transação chegou</h2>
       <p style="color:#8b949e;font-size:.82rem;margin-bottom:8px;">
-        Cole o TXID e o endereço de destino para confirmar se a transação
-        chegou. Funciona para conferir envios e recebimentos, seu ou de outra pessoa.
+        Cole o TXID e o endereço de destino para confirmar se a transação chegou.
       </p>
 
       <label>TXID da transação</label>
@@ -381,16 +492,6 @@
       </div>
       <div class="msg" id="mBridgeClaim"></div>
     </div>
-
-    <div class="card">
-      <h2>Histórico de conversões (BTC→BRN)</h2>
-      <table>
-        <thead><tr><th>TXID BTC</th><th>BRN recebido</th><th>Bloco BRN</th><th>Status</th></tr></thead>
-        <tbody id="tbodyBridge">
-          <tr><td colspan="4" style="color:#8b949e;">—</td></tr>
-        </tbody>
-      </table>
-    </div>
   </div>
 
   <!-- ============ ARQUIVO ============ -->
@@ -421,7 +522,7 @@
     </div>
   </div>
 
-  <div class="footer">BRN Wallet v3.7 · ponte pywebview · <span id="apiLbl">—</span></div>
+  <div class="footer">BRN Wallet v3.8 · ponte pywebview · <span id="apiLbl">—</span></div>
 </div>
 
 <script>
@@ -435,6 +536,8 @@ let ready = false;
 let miningRunning = false;
 let miningBusy = false;
 let lastSentTxid = "";
+let syncTimer = null;
+let syncMode = "idle";
 
 // ============================================================
 // HELPERS
@@ -492,7 +595,7 @@ async function refreshStatus() {
 }
 
 // ============================================================
-// SYNC INFO
+// SYNC INFO (topbar)
 // ============================================================
 async function refreshSyncInfo() {
   try {
@@ -532,6 +635,146 @@ async function refreshSyncInfo() {
   } catch (e) {
     // silencioso
   }
+}
+
+// ============================================================
+// SINCRONIZAÇÃO
+// ============================================================
+async function syncCheckConnection() {
+  syncMode = "checking";
+  msg("mSync", "🔍 Verificando conexão com o nó...", "info");
+
+  try {
+    const s = await api("node_status");
+    if (!s.ok) throw new Error(s.msg || "nó offline");
+
+    const peers = s.peers || 0;
+    const height = s.height || 0;
+
+    if (peers === 0) {
+      msg("mSync", "⚠️ Nó online, mas sem peers. Não é possível sincronizar.", "warn", 6000);
+      syncMode = "error";
+      return false;
+    }
+
+    msg("mSync", "✅ Nó online | altura=" + height + " | peers=" + peers, "ok", 5000);
+    syncMode = "idle";
+    return true;
+  } catch (e) {
+    msg("mSync", "❌ " + e.message, "err");
+    syncMode = "error";
+    return false;
+  }
+}
+
+async function syncStart() {
+  syncMode = "syncing";
+  $("syncProgress").classList.add("show");
+  $("syncBadgeOk").classList.remove("show");
+  $("bSyncStop").style.display = "inline-block";
+
+  msg("mSync", "🔄 Verificando conexão com o nó...", "info");
+
+  const connected = await syncCheckConnection();
+  if (!connected) {
+    $("syncStatusText").textContent = "Falha na conexão";
+    $("syncProgressBar").style.background = "#f85149";
+    $("bSyncStop").style.display = "none";
+    return;
+  }
+
+  if (syncTimer) clearInterval(syncTimer);
+  syncTimer = setInterval(syncUpdateProgress, 3000);
+  await syncUpdateProgress();
+}
+
+async function syncUpdateProgress() {
+  try {
+    const d = await api("sync_info");
+    if (d.erro) throw new Error(d.erro);
+
+    const height = (d.sync && d.sync.height) || 0;
+    const target = (d.sync && d.sync.target) || 0;
+    const peers  = (d.sync && d.sync.peers)  || 0;
+    const percent = (d.sync && d.sync.percent) || 0;
+
+    $("syncHeight").textContent = height;
+    $("syncTarget").textContent = target;
+    $("syncPeers").textContent  = peers;
+
+    const bar = $("syncProgressBar");
+    const pctEl = $("syncPercent");
+    const statusEl = $("syncStatusText");
+
+    let statusText = "";
+    let barColor = "#58a6ff";
+
+    if (peers === 0) {
+      statusText = "🔌 Sem peers conectados";
+      barColor = "#f85149";
+      bar.style.width = "0%";
+      pctEl.textContent = "0%";
+      msg("mSync", "❌ Nenhum peer conectado. Verifique a rede.", "err", 6000);
+      syncMode = "error";
+    } else if (target === 0) {
+      statusText = "⏳ Aguardando dados do peer...";
+      barColor = "#d29922";
+      bar.style.width = "0%";
+      pctEl.textContent = "0%";
+      msg("mSync", "⏳ Peer(s) conectado(s), aguardando altura alvo...", "info");
+    } else if (height >= target) {
+      statusText = "✅ Sincronizado";
+      barColor = "#3fb950";
+      bar.style.width = "100%";
+      pctEl.textContent = "100%";
+
+      if (syncMode !== "synced") {
+        syncMode = "synced";
+        $("syncBadgeOk").classList.add("show");
+        $("syncCompleteInfo").textContent =
+          "Altura final: " + height + " · " + peers + " peer(s)";
+        msg("mSync", "✅ Blockchain sincronizada com sucesso!", "ok", 8000);
+
+        if (syncTimer) {
+          clearInterval(syncTimer);
+          syncTimer = null;
+        }
+      }
+    } else {
+      const falta = target - height;
+      statusText = "📥 Baixando... faltam " + falta + " blocos";
+      barColor = "#58a6ff";
+      bar.style.width = percent + "%";
+      pctEl.textContent = percent.toFixed(2) + "%";
+      msg("mSync",
+          "📥 Baixando " + height + "/" + target + " (" + percent.toFixed(1) + "%)",
+          "info");
+    }
+
+    bar.style.background = barColor;
+    pctEl.style.color = barColor;
+    statusEl.textContent = statusText;
+
+    $("syncBar").style.width = percent + "%";
+    $("syncBar").style.background = barColor;
+    $("syncPct").textContent = percent.toFixed(2) + "%";
+    $("syncPct").style.color = barColor;
+    $("peerCount").textContent = peers;
+
+  } catch (e) {
+    msg("mSync", "❌ " + e.message, "err");
+    syncMode = "error";
+  }
+}
+
+function syncStop() {
+  if (syncTimer) {
+    clearInterval(syncTimer);
+    syncTimer = null;
+  }
+  syncMode = "idle";
+  $("bSyncStop").style.display = "none";
+  msg("mSync", "⏹️ Monitoramento parado.", "info", 3000);
 }
 
 // ============================================================
@@ -759,8 +1002,7 @@ async function enviar() {
 }
 
 // ============================================================
-// MINERAÇÃO TOGGLE — v3.7
-// Agora envia a public_key junto com o endereço
+// MINERAÇÃO
 // ============================================================
 async function minerar() {
   clearMsg("mMine");
@@ -787,7 +1029,6 @@ async function minerar() {
   } else {
     btn.innerHTML = '<span class="spin"></span>Iniciando…';
     try {
-      // [v3.7] Envia public_key — o server usa direto, sem precisar ler arquivo
       const r = await api("start_mining", wallet.address, wallet.public_key);
       if (r && r.ok) {
         msg("mMine", "⛏️ Mineração iniciada. Clique de novo para parar.", "ok", 6000);
@@ -1038,6 +1279,12 @@ function configTabs() {
 }
 
 function configEventos() {
+  // Sync (novo)
+  $("bSyncCheck").onclick = syncCheckConnection;
+  $("bSyncStart").onclick = syncStart;
+  $("bSyncStop").onclick  = syncStop;
+
+  // Restante
   $("bRefreshExp").onclick = carregarBlocos;
   $("bGerar").onclick      = gerarCarteira;
   $("bAtualizar").onclick  = atualizarSaldo;
