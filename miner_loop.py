@@ -1,5 +1,5 @@
 """
-miner_loop.py — Loop de mineracao do BRN (v6.1)
+miner_loop.py — Loop de mineracao do BRN (v6.2)
 ================================================================
 API publica:
     get_miner(chain) -> Miner    (singleton)
@@ -7,15 +7,21 @@ API publica:
     Miner.stop()
     Miner.status() -> dict
 
-v6.1: status() agora expoe 'count', 'last_height', 'uptime'
-      para a carteira web exibir progresso.
+v6.2:
+  [FIX] _ler_carteira_aberta usa secure_store.load_current_wallet
+        (current_wallet.enc) com fallback para current_wallet.json
+  [FIX] _pubkey_no_db usa db.get_utxos em vez de SQL direto
+  [FIX] paths absolutos (BASE_DIR)
+v6.1:
+  [NEW] status() expoe 'count', 'last_height', 'uptime'
 ================================================================
 """
 import os
-import time
 import json
+import time
 import threading
 import traceback
+from pathlib import Path
 
 try:
     from brn_logger import get_logger
@@ -29,7 +35,10 @@ print(f"[Miner] Modulo carregado: {os.path.abspath(__file__)}", flush=True)
 
 MINER_INTERVAL      = int(os.environ.get("BRN_MINER_INTERVAL", "30"))
 MINER_AUTO          = os.environ.get("BRN_MINER_AUTO", "1") == "1"
-CURRENT_WALLET_FILE = "current_wallet.json"
+
+BASE_DIR                 = Path(__file__).resolve().parent
+CURRENT_WALLET_ENC_FILE  = str(BASE_DIR / "current_wallet.enc")
+CURRENT_WALLET_FILE      = str(BASE_DIR / "current_wallet.json")
 
 _MINER_INSTANCE = None
 _MINER_LOCK = threading.Lock()
@@ -45,30 +54,60 @@ def get_miner(chain):
         return _MINER_INSTANCE
 
 
+def _senha_sessao() -> str:
+    return (os.environ.get("BRN_WALLET_SESSION_PASS", "").strip()
+            or os.environ.get("BRN_NODE_PASSWORD", "").strip())
+
+
 def _ler_carteira_aberta():
+    """Lê current_wallet.enc (novo) ou current_wallet.json (legado)."""
+    # 1) tenta .enc via secure_store
+    senha = _senha_sessao()
+    if senha:
+        try:
+            from secure_store import load_current_wallet
+            r = load_current_wallet(senha)
+            if r and r.get("ok"):
+                addr = (r.get("address") or "").strip()
+                pub  = (r.get("pub_hex")
+                        or r.get("public_key")
+                        or r.get("pubkey")
+                        or "").strip()
+                if addr.startswith("brn1"):
+                    return {"address": addr, "pubkey": pub}
+        except Exception as e:
+            _log(f"_ler_carteira_aberta(.enc) falhou: {e}")
+
+    # 2) fallback: .json legado
     try:
-        if not os.path.exists(CURRENT_WALLET_FILE):
-            return {}
-        with open(CURRENT_WALLET_FILE, "r", encoding="utf-8") as f:
-            d = json.load(f)
-        addr = (d.get("address") or "").strip()
-        pub  = (d.get("pubkey") or d.get("public_key") or "").strip()
-        if addr.startswith("brn1"):
-            return {"address": addr, "pubkey": pub}
+        p = Path(CURRENT_WALLET_FILE)
+        if p.exists():
+            with p.open("r", encoding="utf-8") as f:
+                d = json.load(f)
+            addr = (d.get("address") or "").strip()
+            pub  = (d.get("pub_hex")
+                    or d.get("pubkey")
+                    or d.get("public_key")
+                    or "").strip()
+            if addr.startswith("brn1"):
+                return {"address": addr, "pubkey": pub}
     except Exception:
         pass
+
     return {}
 
 
 def _pubkey_no_db(bc, addr):
+    """Fallback: pega pubkey da primeira UTXO da carteira."""
     try:
-        row = bc.db.conn.execute(
-            "SELECT pubkey FROM utxos WHERE address=? AND pubkey != '' LIMIT 1",
-            (addr,)
-        ).fetchone()
-        return row[0] if row and row[0] else ""
+        utxos = bc.db.get_utxos(addr)
+        for u in utxos:
+            pk = (u.get("pubkey") or "").strip()
+            if pk:
+                return pk
     except Exception:
-        return ""
+        pass
+    return ""
 
 
 class Miner:
@@ -81,7 +120,6 @@ class Miner:
         self.running = False
         self.blocks_mined = 0
         self.last_error = ""
-        # v6.1: campos de progresso
         self.last_height = None
         self.started_at = 0.0
 
@@ -197,7 +235,7 @@ def loop_mineracao(chain, intervalo=None):
         ok, msg = m.start(w["address"], w.get("pubkey", ""))
         _log(f"auto-start: {ok} ({msg})")
     else:
-        _log("auto-start: sem carteira aberta — aguardando current_wallet.json")
+        _log("auto-start: sem carteira aberta — aguardando current_wallet")
 
 
 def iniciar_mineracao(chain, intervalo=None):

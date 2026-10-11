@@ -1,32 +1,38 @@
 """
-main.py — Entrypoint unificado do nó BRN (v12)
+main.py — Entrypoint unificado do nó BRN (v12.5)
 ================================================================
-v12 (novo):
-  [NEW] Bloco _HARDCODED_DEFAULTS — configs direto no Python
-        (env vars do sistema e brn_network.env têm prioridade)
-  [NEW] Tailscale automático no boot — chama brn_tailscale_setup.py --auto
-        antes de subir o P2P (se TS_AUTH_KEY estiver definida)
-  [NEW] --no-tailscale para pular o setup do Tailscale
+v12.5:
+  [FIX] CRÍTICO: auto_genesis=not is_origin → auto_genesis=is_origin
+        O "not" invertia a semântica:
+          ORIGEM  (is_origin=True)  → antes virava auto_genesis=False
+                                       (origin NÃO criava genesis)
+          CLIENTE (is_origin=False) → antes virava auto_genesis=True
+                                       (cliente criava genesis local)
+        Como o GENESIS_BLOCK no blockchain.py é determinístico
+        (GENESIS_ADDRESS hardcoded), as hashes casavam por sorte —
+        mas era frágil. Se o genesis for customizado algum dia
+        (genesis_address passado no __init__), o cliente ficaria em fork.
+v12.4:
+  [FIX] blockchain usa is_origin (não args.client_mode)
+v12.3:
+  [NEW] ChainSyncManager instanciado no boot
+  [NEW] _setup_sync() + _list_p2p_peers()
+  [NEW] --no-sync
+v12.2:
+  [FIX] _HARDCODED_DEFAULTS com segredos reais
+  [FIX] server.set_chain + auto_registrar_carteira_atual()
+  [FIX] BRN_SKIP_VERIFY default "0"
+  [FIX] miner wallet pub_hex/pubkey_hex compat
+v12.1:
+  [FIX] server.set_chain + auto-registro
+v12:
+  [NEW] _HARDCODED_DEFAULTS
+  [NEW] Tailscale automático
 v11:
-  [FIX] BASE_DIR definido ANTES de _bootstrap_env
-  [FIX] load_wallet/save_wallet com ordem correta
-  [FIX] --password rejeitado
+  [FIX] BASE_DIR antes de _bootstrap_env
   [FIX] _is_origin fail-safe: na dúvida, CLIENTE
-  [FIX] WEB_HOST/EXPLORER_HOST configuráveis
-  [FIX] 2º Ctrl+C força os._exit(1)
-  [FIX] _verify_chain tri-state: OK / INVALID / ERROR
-  [FIX] _graceful_shutdown com timeout
-  [FIX] Audit de boot após genesis
-  [FIX] Status loop loga erros
-  [FIX] Miner wallet em miner_wallet.enc
-  [FIX] SIGHUP tratado
-  [FIX] F-strings com aspas aninhadas removidas
-  [NEW] threading.excepthook + _thread_wrap
-  [NEW] _check_required_modules() no boot
-  [NEW] Rendezvous discovery integrado
-  [NEW] Relay E2E (p2p_relay v2.0)
-  [NEW] Mongo health no status loop
-  [NEW] AUTO_MINE opt-in (BRN_AUTO_MINE=1)
+  [FIX] 2º Ctrl+C força saída
+  [FIX] _verify_chain tri-state
 ================================================================
 """
 from __future__ import annotations
@@ -73,9 +79,9 @@ def _bootstrap_env() -> None:
 # ------------------------------------------------------------
 # Aplica só se a variável NÃO estiver no ambiente.
 # Prioridade final:
-#   1) Shell / .bat (maior)
+#   1) Shell / .bat          (maior)
 #   2) brn_network.env
-#   3) _HARDCODED_DEFAULTS (menor)
+#   3) _HARDCODED_DEFAULTS   (menor — este bloco)
 # ============================================================
 _HARDCODED_DEFAULTS = {
     # --- Identidade do nó ---
@@ -101,7 +107,7 @@ _HARDCODED_DEFAULTS = {
     "BRN_P2P_NONCE_CACHE":     "10000",
 
     # --- Verify ---
-    "BRN_SKIP_VERIFY":         "1",
+    "BRN_SKIP_VERIFY":         "0",
     "BRN_VERIFY_STRICT":       "0",
 
     # --- Tracker ---
@@ -114,7 +120,6 @@ _HARDCODED_DEFAULTS = {
     "MONGO_DB":                "brn_analytics",
 
     # --- Tailscale ---
-    # Deixe vazio (ou com placeholder) para desabilitar Tailscale automático.
     "TS_AUTH_KEY":             "",
     "TS_API_KEY":              "",
     "TS_TAILNET":              "",
@@ -150,14 +155,11 @@ _shutdown = threading.Event()
 NODE_ID_PATH        = BASE_DIR / "node_identity.enc"
 CLIENT_BOOT_TIMEOUT = int(os.environ.get("BRN_CLIENT_BOOT_TIMEOUT", "120"))
 
-# Hosts configuráveis (default seguro)
 WEB_HOST      = os.environ.get("BRN_WEB_HOST",      "127.0.0.1")
 EXPLORER_HOST = os.environ.get("BRN_EXPLORER_HOST", "127.0.0.1")
 
-# Auto-mine opt-in
 AUTO_MINE     = os.environ.get("BRN_AUTO_MINE", "0") == "1"
 
-# Tracking de serviços para shutdown limpo
 _running_services: list = []
 _services_lock = threading.Lock()
 
@@ -198,7 +200,7 @@ def _thread_wrap(name: str, fn):
 
 
 # ============================================================
-# CHECAGEM DE MÓDULOS OBRIGATÓRIOS
+# MÓDULOS OBRIGATÓRIOS
 # ============================================================
 def _check_required_modules() -> list:
     required = [
@@ -216,7 +218,7 @@ def _check_required_modules() -> list:
 
 
 # ============================================================
-# L2 IMPORTS — fallback que NUNCA quebra o nó
+# L2 — fallback que NUNCA quebra o nó
 # ============================================================
 L2_ENABLED = False
 btc_config = None
@@ -259,13 +261,9 @@ def _close_audit() -> None:
 
 
 # ============================================================
-# [v12] TAILSCALE AUTO-SETUP
+# TAILSCALE AUTO-SETUP
 # ============================================================
 def _setup_tailscale_auto(log) -> bool:
-    """
-    Chama brn_tailscale_setup.py --auto se TS_AUTH_KEY estiver definida.
-    Retorna True se OK (ou se Tailscale estiver desabilitado), False se falhou.
-    """
     auth_key = os.environ.get("TS_AUTH_KEY", "").strip()
     if not auth_key:
         log.info("Tailscale: desabilitado (TS_AUTH_KEY vazia)")
@@ -315,9 +313,8 @@ def parse_args():
     p.add_argument("--config", default="config.json")
     p.add_argument("--log-level", default=None)
     p.add_argument("--log-file", default=None)
-    p.add_argument("--password", default=None,
-                   help="(INSEGURO — visível em ps) prefira --password-file")
-    p.add_argument("--password-file", default=None)
+    p.add_argument("--password-file", default=None,
+                   help="arquivo com a senha do nó (uma linha)")
     p.add_argument("--rotate-node-id", action="store_true")
     p.add_argument("--client-mode", action="store_true")
     p.add_argument("--discover", action="store_true")
@@ -333,6 +330,8 @@ def parse_args():
     p.add_argument("--skip-verify", action="store_true")
     p.add_argument("--no-tailscale", action="store_true",
                    help="Desabilita setup automático do Tailscale neste boot")
+    p.add_argument("--no-sync", action="store_true",
+                   help="Não sincronizar cadeia com peers (debug)")
     return p.parse_args()
 
 
@@ -345,11 +344,6 @@ def _resolve_password(args) -> str:
         if not p.exists():
             raise SystemExit("--password-file não encontrado: " + str(p))
         return p.read_text(encoding="utf-8").rstrip("\r\n")
-    if args.password:
-        raise SystemExit(
-            "[!] --password é inseguro (visível em `ps`).\n"
-            "    Use --password-file, BRN_NODE_PASSWORD, ou rode interativo."
-        )
     env = os.environ.get("BRN_NODE_PASSWORD")
     if env:
         return env
@@ -360,10 +354,6 @@ def _resolve_password(args) -> str:
 
 
 def load_or_create_node_identity(password: str, rotate: bool = False):
-    """
-    ATENÇÃO: assinatura de secure_store é (data, password, path) para save,
-    e (password, path) para load.
-    """
     from crypto import Ed25519PrivateKey
     from secure_store import save_wallet, load_wallet
 
@@ -592,10 +582,38 @@ def _do_discover_diagnostic(cfg):
 
 
 # ============================================================
-# THREADS DE SERVIÇO
+# HTTP / EXPLORER
 # ============================================================
-def run_http():
-    from server import app as http_app
+def _init_http_server(chain, log):
+    try:
+        from server import (
+            app as http_app,
+            set_chain,
+            auto_registrar_carteira_atual,
+        )
+    except Exception as e:
+        log.error("Falha importando server.py: " + str(e))
+        return None
+
+    try:
+        set_chain(chain)
+    except Exception as e:
+        log.error("Falha set_chain: " + str(e))
+        return None
+
+    try:
+        reg = auto_registrar_carteira_atual()
+        if reg.get("ok"):
+            log.info("auto-registro pubkey: " + str(reg.get("msg")))
+        else:
+            log.info("auto-registro pubkey: pulado (" + str(reg.get("msg")) + ")")
+    except Exception as e:
+        log.warning("auto-registro pubkey falhou: " + str(e))
+
+    return http_app
+
+
+def run_http(app_instance):
     log = get_logger("http")
     port = int(os.environ.get("BRN_WEB_PORT", "5000"))
     ssl_ctx = None
@@ -610,7 +628,7 @@ def run_http():
             ssl_ctx = None
     if ssl_ctx is None:
         log.info("HTTP http://" + WEB_HOST + ":" + str(port))
-    http_app.run(
+    app_instance.run(
         host=WEB_HOST, port=port, threaded=True,
         debug=False, use_reloader=False, ssl_context=ssl_ctx,
     )
@@ -635,7 +653,7 @@ def run_explorer():
     )
 
 
-def run_status_loop(chain, p2p, l2_manager=None):
+def run_status_loop(chain, p2p, l2_manager=None, sync=None):
     log = get_logger("status")
     if p2p is None:
         log.warning("P2P desabilitado — status loop sem peers")
@@ -670,6 +688,20 @@ def run_status_loop(chain, p2p, l2_manager=None):
                    + " Relay=" + str(relay_routes)
                    + " Mempool=" + str(mempool_n)
                    + " UTXOs=" + str(utxos_n))
+
+            if sync is not None:
+                try:
+                    s = sync.get_status()
+                    msg += (" Sync=" + str(s.get("mode", "?"))
+                            + "/" + str(s.get("local_height", 0))
+                            + "→" + str(s.get("target_height", 0))
+                            + " (" + str(s.get("progress", 0)) + "%)")
+                    if s.get("active_peer"):
+                        msg += " via " + str(s["active_peer"])[:12]
+                    if s.get("last_error"):
+                        msg += " err=" + str(s["last_error"])[:40]
+                except Exception:
+                    pass
 
             if l2_manager is not None:
                 try:
@@ -773,6 +805,135 @@ def _setup_relay(p2p, node_id_priv, enabled):
         srv.on_relay_data = relay.handle_relay_data
 
     return relay
+
+
+# ============================================================
+# SYNC SETUP
+# ============================================================
+def _list_p2p_peers(p2p):
+    """
+    Normaliza a lista de peers do p2p_unified para
+    (ip, port, node_id, height, work).
+    """
+    out = []
+
+    def _pick(v, *names):
+        for n in names:
+            if isinstance(v, dict):
+                if n in v and v[n] is not None:
+                    return v[n]
+            else:
+                val = getattr(v, n, None)
+                if val is not None:
+                    return val
+        return None
+
+    try:
+        peers = getattr(p2p, "peers", None)
+        items = []
+        if isinstance(peers, dict):
+            items = list(peers.items())
+        elif isinstance(peers, list):
+            items = [(None, v) for v in peers]
+
+        for node_id, v in items:
+            ip    = _pick(v, "ip", "address", "host")
+            port  = _pick(v, "port")
+            nid   = node_id or _pick(v, "node_id", "uuid", "id") or ""
+            height = _pick(v, "height", "h") or 0
+            work   = _pick(v, "cumulative_work", "work") or 0
+            if ip and port:
+                try:
+                    out.append((str(ip), int(port), str(nid),
+                                int(height), int(work)))
+                except (ValueError, TypeError):
+                    pass
+        if out:
+            return out
+    except Exception:
+        pass
+
+    fn = getattr(p2p, "listar_peers", None)
+    if callable(fn):
+        try:
+            raw = fn()
+            if isinstance(raw, list):
+                for item in raw:
+                    if isinstance(item, str) and ":" in item:
+                        ip, _, port_s = item.rpartition(":")
+                        try:
+                            out.append((ip, int(port_s), "", 0, 0))
+                        except ValueError:
+                            pass
+                    elif isinstance(item, dict):
+                        ip = item.get("ip")
+                        port = item.get("port")
+                        if ip and port:
+                            out.append((str(ip), int(port),
+                                        str(item.get("node_id", "")),
+                                        int(item.get("height", 0) or 0),
+                                        int(item.get("cumulative_work", 0) or 0)))
+        except Exception:
+            pass
+    return out
+
+
+def _setup_sync(chain, p2p, log):
+    """
+    Instancia ChainSyncManager, popula peers conhecidos e inicia o loop.
+    """
+    if p2p is None:
+        log.info("Sync: P2P desligado — sem sync")
+        return None
+
+    try:
+        from sync_manager import ChainSyncManager
+    except ImportError as e:
+        log.warning("sync_manager indisponível: " + str(e))
+        return None
+
+    try:
+        sync = ChainSyncManager(chain, chain.db, p2p)
+    except Exception as e:
+        log.warning("ChainSyncManager falhou: " + str(e))
+        return None
+
+    n_inicial = 0
+    for ip, port, node_id, height, work in _list_p2p_peers(p2p):
+        try:
+            sync.register_peer(node_id or f"{ip}:{port}",
+                               ip, port, height, work)
+            n_inicial += 1
+        except Exception as e:
+            log.debug("sync.register_peer falhou: " + str(e))
+    log.info("Sync: " + str(n_inicial) + " peer(s) registrados inicialmente")
+
+    def _on_peer_found(node_id, ip, port, height=0, work=0):
+        try:
+            sync.register_peer(node_id or f"{ip}:{port}",
+                               ip, port, height, work)
+        except Exception:
+            pass
+
+    for hook in ("on_peer_added", "on_peer"):
+        if hasattr(p2p, hook):
+            try:
+                setattr(p2p, hook, _on_peer_found)
+                log.info("Sync: gancho " + hook + " ligado")
+                break
+            except Exception:
+                pass
+
+    try:
+        sync.set_sync_mode("full")
+        sync.start_sync_loop()
+        log.info("Sync iniciado (full mode, batch="
+                 + str(getattr(sync, "batch_size", "?")) + ")")
+    except Exception as e:
+        log.warning("sync.start_sync_loop falhou: " + str(e))
+        return sync
+
+    return sync
 
 
 # ============================================================
@@ -890,7 +1051,7 @@ def main():
         log.error("Módulos obrigatórios faltando: " + ", ".join(missing))
         return 1
 
-    # ---- [v12] Tailscale automático (antes de P2P) ----
+    # ---- Tailscale automático (antes de P2P) ----
     if not args.no_tailscale:
         _setup_tailscale_auto(log)
     else:
@@ -906,8 +1067,11 @@ def main():
     log.info("Nó ID: " + node_id_pub)
 
     # ---- blockchain ----
+    # [v12.5 FIX] auto_genesis = is_origin (não "not is_origin")
+    #   ORIGEM  (is_origin=True)  → auto_genesis=True  → cria genesis
+    #   CLIENTE (is_origin=False) → auto_genesis=False → espera sync
     from blockchain import Blockchain
-    chain = Blockchain(cfg["db_path"], auto_genesis=not args.client_mode)
+    chain = Blockchain(cfg["db_path"], auto_genesis=is_origin)
     log.info("Altura atual: " + str(chain.db.height()))
 
     # ---- checkpoints ----
@@ -973,6 +1137,15 @@ def main():
             _register_service("relay", relay)
             log.info("Relay E2E pronto")
 
+    # ---- SYNC ----
+    sync = None
+    if not args.no_sync:
+        sync = _setup_sync(chain, p2p, log)
+        if sync:
+            _register_service("sync", sync)
+    else:
+        log.info("Sync: pulado por --no-sync")
+
     # ---- Rendezvous ----
     rdv = None
     rdv_url = os.environ.get("BRN_RENDEZVOUS_URL", "").strip()
@@ -1021,9 +1194,18 @@ def main():
     elif args.l2:
         log.warning("--l2 solicitado, mas L2 não disponível. Ignorando.")
 
-    # ---- HTTP + Explorer ----
-    threading.Thread(target=_thread_wrap("HTTP", run_http),
-                     daemon=True, name="HTTP").start()
+    # ---- HTTP ----
+    http_app = _init_http_server(chain, log)
+
+    if http_app is not None:
+        threading.Thread(
+            target=_thread_wrap("HTTP", lambda: run_http(http_app)),
+            daemon=True, name="HTTP",
+        ).start()
+    else:
+        log.error("HTTP server não pôde ser inicializado — seguindo sem API")
+
+    # ---- Explorer ----
     threading.Thread(target=_thread_wrap("Explorer", run_explorer),
                      daemon=True, name="Explorer").start()
 
@@ -1057,9 +1239,15 @@ def main():
                 except Exception as e:
                     log.warning("Falha ao salvar miner wallet: " + str(e))
 
-            miner.start(mw.address, mw.pubkey_hex)
-            _register_service("miner", miner)
-            log.info("Miner iniciado com " + mw.address)
+            pub = (getattr(mw, "pub_hex", None)
+                   or getattr(mw, "pubkey_hex", "")
+                   or "")
+            if not pub:
+                log.error("Miner wallet sem pub_hex/pubkey_hex — abortando miner")
+            else:
+                miner.start(mw.address, pub)
+                _register_service("miner", miner)
+                log.info("Miner iniciado com " + mw.address)
         except Exception as e:
             log.warning("Miner falhou: " + str(e))
 
@@ -1067,13 +1255,13 @@ def main():
     threading.Thread(
         target=_thread_wrap(
             "StatusLoop",
-            lambda: run_status_loop(chain, p2p, l2_manager),
+            lambda: run_status_loop(chain, p2p, l2_manager, sync),
         ),
         daemon=True, name="StatusLoop",
     ).start()
 
     # ---- Cliente aguarda genesis ----
-    if args.client_mode and chain.db.height() < 0:
+    if not is_origin and chain.db.height() < 0:
         log.info("Aguardando genesis (timeout " + str(CLIENT_BOOT_TIMEOUT) + "s)...")
         t0 = time.time()
         while chain.db.height() < 0 and (time.time() - t0) < CLIENT_BOOT_TIMEOUT:
@@ -1081,7 +1269,7 @@ def main():
                 break
             time.sleep(1)
 
-    # ---- AUDIT: só depois do genesis ----
+    # ---- AUDIT ----
     _audit("node_start", {
         "mode":       "origin" if is_origin else "client",
         "l2":         bool(args.l2 and l2_ativo),
@@ -1091,6 +1279,7 @@ def main():
         "node_id":    node_id_pub[:16],
         "rendezvous": bool(rdv),
         "relay":      bool(relay),
+        "sync":       bool(sync),
         "tailscale":  bool(os.environ.get("TS_TAILNET", "").strip()),
     })
 
@@ -1125,7 +1314,7 @@ def main():
 
 
 # ============================================================
-# SIGNAL HANDLERS — 2º Ctrl+C força saída
+# SIGNAL HANDLERS
 # ============================================================
 _signal_count = 0
 

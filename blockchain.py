@@ -1,7 +1,17 @@
 """
 blockchain.py — Núcleo da Blockchain BRN
-Versão: 9.1.4 | Data: 05/10/2026
+Versão: 9.1.5 | Data: 11/10/2026
+(v9.1.5 — Fix: genesis não exige pubkey na coinbase)
 (v9.1.4 — Checkpoints assinados + Auth Tag + Reorg + Contratos)
+================================================================
+v9.1.5:
+  [FIX] validate_block não exige pubkey em coinbase do genesis (#0).
+        O genesis é escrito direto no DB pelo __init__ (db.add_block),
+        sem passar por validate_block. Mas quando um CLIENTE recebe o
+        genesis via P2P, ele passa pelo validate_block — e era rejeitado
+        com "coinbase output sem pubkey". Agora só exige pubkey em
+        blocos height > 0.
+================================================================
 """
 import os
 import time
@@ -589,9 +599,15 @@ class Blockchain:
             return False, "primeira tx nao e coinbase"
         if cb.get("txid") != txid(cb):
             return False, "coinbase txid invalido"
-        for out in cb["outputs"]:
-            if not out.get("pubkey"):
-                return False, "coinbase output sem pubkey"
+
+        # [v9.1.5 FIX] Genesis (#0) é escrito direto no DB pelo __init__,
+        # sem passar pelo validate_block. Por isso ele pode ter pubkey vazia
+        # (GENESIS_PUBKEY = ""). Blocos normais (>0) continuam exigindo pubkey.
+        if block["height"] > 0:
+            for out in cb["outputs"]:
+                if not out.get("pubkey"):
+                    return False, "coinbase output sem pubkey"
+
         for inp in cb["inputs"]:
             if inp.get("signature"):
                 return False, "coinbase input com assinatura"

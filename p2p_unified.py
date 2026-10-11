@@ -1,6 +1,11 @@
 """
-p2p_unified.py — BRN P2P Network v6.6
+p2p_unified.py — BRN P2P Network v6.6.1
 ================================================================
+v6.6.1:
+  [FIX] CRÍTICO: _chain e _uuid agora são adicionados ANTES do build_auth()
+        — antes eram adicionados DEPOIS, quebrando o msg_hash do cliente
+        e fazendo TODA resposta ser rejeitada por "assinatura invalida".
+        Resultado prático: Peers=0 eternamente, sync nunca começa.
 v6.6:
   [NEW] Hooks de relay no P2PServer:
     - on_relay_caps       — capabilities anunciadas
@@ -532,7 +537,7 @@ class UPnPClient:
 
 
 # ============================================================
-# SERVIDOR TCP (v6.6 — com hooks de relay)
+# SERVIDOR TCP (v6.6.1 — com hooks de relay + fix de auth)
 # ============================================================
 class P2PServer(threading.Thread):
     def __init__(self, blockchain, port: int, metrics: Metrics,
@@ -674,6 +679,17 @@ class P2PServer(threading.Thread):
 
             response = self._process_message(msg, addr, peer_id)
             if response:
+                # ============================================================
+                # [FIX v6.6.1] CRÍTICO: _chain e _uuid são adicionados ANTES
+                # de assinar. Antes eram adicionados DEPOIS, então:
+                #   - servidor assinava o payload SEM _chain/_uuid
+                #   - cliente recalculava msg_hash COM _chain/_uuid
+                #   - hashes divergem → "assinatura invalida"
+                #   - cliente rejeitava TODA resposta → Peers=0 → sync morto
+                # ============================================================
+                response["_chain"] = CHAIN_ID
+                response["_uuid"] = self.node_uuid
+
                 if auth_enabled():
                     try:
                         resp_sem = {k: v for k, v in response.items()
@@ -682,9 +698,6 @@ class P2PServer(threading.Thread):
                     except Exception as e:
                         log.warning(f"falha ao assinar resposta: {e}")
 
-                response["_chain"] = CHAIN_ID
-                # v6.6: expõe uuid para PeerDirectory do relay
-                response["_uuid"] = self.node_uuid
                 payload = NETWORK_MAGIC + json.dumps(response).encode()
                 conn.sendall(payload)
                 self.metrics.inc("messages_out")
@@ -1695,4 +1708,3 @@ class P2PManager:
 
 if __name__ == "__main__":
     print("Rode via main.py")
-    

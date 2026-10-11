@@ -8,6 +8,10 @@ Uso:
     result = verify_chain(blockchain)          # ChainVerificationResult
     result = verify_chain_dict(blockchain)     # dict serializavel
 
+v9.1.5:
+  - [FIX] Genesis (#0) não exige pubkey na coinbase. Blocos > 0 continuam
+    exigindo. Mesmo problema do validate_block no blockchain.py.
+
 v9.1.4:
   - [SEGURANÇA] Verifica checkpoints assinados (checkpoints.json)
     durante o verify_chain. Rejeita qualquer bloco cujo hash nao
@@ -92,10 +96,6 @@ class ChainVerificationResult:
 # HELPERS DE VALIDACAO CRIPTOGRAFICA
 # ============================================================
 def _verify_tx_signature(tx: dict) -> tuple:
-    """
-    Verifica a assinatura de uma tx nao-coinbase.
-    Retorna (ok, motivo). Motivo vazio se ok.
-    """
     from blockchain import signing_hash
     from wallet import Wallet
 
@@ -121,12 +121,6 @@ def _has_required_fields(tx: dict) -> bool:
 
 
 def _pubkey_matches_from(tx: dict) -> tuple:
-    """
-    Bind pubkey -> endereco -> input. Evita ataque onde o atacante
-    troca 'from'/'pubkey' mantendo a assinatura original.
-
-    v9.1.1: usa bech32.address_from_pubkey (mesma funcao do blockchain).
-    """
     try:
         from bech32 import address_from_pubkey
     except ImportError:
@@ -151,10 +145,6 @@ def _pubkey_matches_from(tx: dict) -> tuple:
 # v9.1.1: VERIFICACAO DO AUTH TAG (HMAC)
 # ============================================================
 def _verify_block_auth_tag(block: dict, blockchain) -> tuple:
-    """
-    Verifica auth_tag do bloco se a blockchain exigir.
-    Retorna (ok, motivo). Motivo vazio se ok.
-    """
     if not getattr(blockchain, "require_auth_tag", False):
         return True, ""
 
@@ -181,12 +171,6 @@ def _verify_block_auth_tag(block: dict, blockchain) -> tuple:
 # v9.1.4: VERIFICACAO DE CHECKPOINT ASSINADO
 # ============================================================
 def _verify_block_checkpoint(block: dict) -> tuple:
-    """
-    Se existir checkpoint assinado para a altura do bloco, valida que:
-      1. O hash do bloco bate com o hash do checkpoint
-      2. A assinatura Ed25519 do checkpoint e valida
-    Retorna (existe_checkpoint, ok, motivo).
-    """
     h_str = str(block["height"])
     cp = _CHECKPOINTS.get(h_str)
     if not cp:
@@ -212,28 +196,6 @@ def _verify_block_checkpoint(block: dict) -> tuple:
 # VALIDACAO PRINCIPAL
 # ============================================================
 def verify_chain(blockchain) -> ChainVerificationResult:
-    """
-    Verifica toda a cadeia do genesis ate o topo.
-
-    Checagens:
-      1.  Genesis valido (height 0, prev_hash zerado)
-      2.  Alturas sequenciais
-      3.  Encadeamento (prev_hash == hash anterior)
-      4.  Hash declarado == recalculado
-      5.  PoW valido (hash <= target)
-      6.  Merkle root confere com txids
-      7.  Primeira tx do bloco e coinbase
-      8.  Coinbase <= recompensa + taxas
-      9.  Ausencia de gasto duplo
-      10. Ausencia de txid duplicada
-      11. Ausencia de saldo negativo
-      12. Recompensa compativel com halving
-      13. [v6] Assinatura Ed25519 valida em txs nao-coinbase
-      14. [v6] Pubkey corresponde ao 'from'
-      15. [v6] Coinbase NAO tem assinatura nem pubkey no input
-      16. [v9.1.1] auth_tag (HMAC) valido quando require_auth_tag=True
-      17. [v9.1.4] Checkpoint assinado valido em alturas multiplas de 1000
-    """
     from blockchain import (
         block_hash, meets_difficulty, compute_merkle_root,
         txid as calc_txid, GENESIS_PREV,
@@ -266,24 +228,20 @@ def verify_chain(blockchain) -> ChainVerificationResult:
         result.blocks_checked += 1
         prefixo = f"Bloco #{h}"
 
-        # 1) genesis
         if h == 0:
             if block["height"] != 0:
                 result.add_error(f"{prefixo}: height != 0")
             if block["prev_hash"] != GENESIS_PREV:
                 result.add_error(f"{prefixo}: prev_hash de genesis invalido")
 
-        # 2) altura sequencial
         if block["height"] != h:
             result.add_error(f"{prefixo}: height declarado = {block['height']}")
 
-        # 3) encadeamento
         if h > 0 and block["prev_hash"] != prev_hash:
             result.add_error(
                 f"{prefixo}: prev_hash nao corresponde ao bloco #{h-1}"
             )
 
-        # 4) hash recalculado
         recalc = block_hash(
             block["prev_hash"], block["merkle"], block["timestamp"],
             block["nonce"], block["difficulty"],
@@ -294,13 +252,11 @@ def verify_chain(blockchain) -> ChainVerificationResult:
                 f"({block['hash'][:14]}... vs {recalc[:14]}...)"
             )
 
-        # 5) PoW
         if not meets_difficulty(block["hash"], block["difficulty"]):
             result.add_error(
                 f"{prefixo}: nao atende a dificuldade {block['difficulty']}"
             )
 
-        # 6) merkle
         txids = [t["txid"] for t in block["transactions"]]
         merkle_calc = compute_merkle_root(txids)
         if merkle_calc != block["merkle"]:
@@ -309,7 +265,6 @@ def verify_chain(blockchain) -> ChainVerificationResult:
                 f"({block['merkle'][:12]}... vs {merkle_calc[:12]}...)"
             )
 
-        # 16) auth_tag (v9.1.1)
         if require_auth:
             ok_tag, motivo_tag = _verify_block_auth_tag(block, blockchain)
             if not ok_tag:
@@ -317,7 +272,6 @@ def verify_chain(blockchain) -> ChainVerificationResult:
             else:
                 result.auth_tags_checked += 1
 
-        # 17) checkpoint assinado (v9.1.4)
         existe_cp, ok_cp, motivo_cp = _verify_block_checkpoint(block)
         if existe_cp:
             if not ok_cp:
@@ -325,7 +279,6 @@ def verify_chain(blockchain) -> ChainVerificationResult:
             else:
                 result.checkpoints_checked += 1
 
-        # 7) coinbase
         if not block["transactions"]:
             result.add_error(f"{prefixo}: bloco sem transacoes")
             prev_hash = block["hash"]
@@ -336,7 +289,6 @@ def verify_chain(blockchain) -> ChainVerificationResult:
         if not is_cb:
             result.add_error(f"{prefixo}: primeira tx nao e coinbase")
 
-        # 8) coinbase <= recompensa + taxas
         if is_cb:
             reward_esp = blockchain.current_reward(h)
             fees = 0
@@ -351,39 +303,44 @@ def verify_chain(blockchain) -> ChainVerificationResult:
                     f"{prefixo}: coinbase {cb_total} > "
                     f"recompensa {reward_esp} + taxas {fees}"
                 )
+
+            # [v9.1.5 FIX] Genesis (#0) pode ter pubkey vazia
+            # (GENESIS_PUBKEY = ""). Blocos > 0 continuam exigindo pubkey.
+            if h > 0:
+                for out in cb["outputs"]:
+                    if not out.get("pubkey"):
+                        result.add_error(
+                            f"{prefixo}: coinbase output sem pubkey"
+                        )
+                        break
+
             for inp in cb["inputs"]:
                 if inp.get("signature") or inp.get("pubkey"):
                     result.add_error(
                         f"{prefixo}: coinbase input com assinatura/pubkey"
                     )
 
-        # 9..15) cada tx
         for idx, t in enumerate(block["transactions"]):
             result.txs_checked += 1
             short = t.get("txid", "?")[:12]
 
-            # 9) txid canonico
             try:
                 if t["txid"] != calc_txid(t):
                     result.add_error(f"{prefixo}: tx {short}... txid adulterado")
             except Exception as e:
                 result.add_error(f"{prefixo}: erro ao recalcular txid ({e})")
 
-            # 10) txid duplicada
             if t["txid"] in all_txids:
                 result.add_error(f"{prefixo}: txid duplicada {short}...")
             all_txids.add(t["txid"])
 
-            # Coinbase — pula as checagens de assinatura
             if idx == 0 and is_cb:
                 continue
 
-            # 13) campos obrigatorios
             if not _has_required_fields(t):
                 result.add_error(f"{prefixo}: tx {short}... faltando campos")
                 continue
 
-            # 14) assinatura
             ok_sig, motivo = _verify_tx_signature(t)
             if not ok_sig:
                 result.add_error(f"{prefixo}: tx {short}... {motivo}")
@@ -391,12 +348,10 @@ def verify_chain(blockchain) -> ChainVerificationResult:
                     spent_utxos.add((inp["txid"], inp["vout"]))
                 continue
 
-            # 15) binding pubkey <-> from
             ok_bind, motivo_bind = _pubkey_matches_from(t)
             if not ok_bind:
                 result.add_error(f"{prefixo}: tx {short}... {motivo_bind}")
 
-            # 9) gasto duplo
             for inp in t["inputs"]:
                 key = (inp["txid"], inp["vout"])
                 if key in spent_utxos:
@@ -408,7 +363,6 @@ def verify_chain(blockchain) -> ChainVerificationResult:
 
         prev_hash = block["hash"]
 
-    # 11) saldo negativo
     try:
         neg = db.conn.execute(
             "SELECT address, SUM(amount) AS s FROM utxos "

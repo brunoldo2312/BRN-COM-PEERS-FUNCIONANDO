@@ -1,18 +1,17 @@
 @echo off
 REM ============================================================
-REM   iniciar.bat - BRN Node CLIENTE (Windows) - v2
+REM   iniciar.bat - BRN Node CLIENTE (Windows) - v3
 REM ============================================================
-REM   Equivalente ao iniciar.sh do Linux/Mac.
-REM   ASCII only (sem acentos).
-REM
+REM   v3:
+REM     [NEW] cria brn_network.env automaticamente se faltar (Opção B)
+REM          — antes abortava com "[X] brn_network.env NAO existe"
 REM   v2:
 REM     [FIX] carrega brn_network.env ANTES do tailscale
-REM     [FIX] passa --no-tailscale pro main.py (evita setup 2x)
+REM     [FIX] passa --no-tailscale pro main.py
 REM     [FIX] checa TODOS os modulos obrigatorios
 REM     [FIX] parser de env trata comentarios (eol=#)
 REM     [FIX] fingerprint via Python (nao interpola na shell)
 REM     [FIX] bootstrap_peers.json sem IP hardcoded
-REM     [FIX] deteccao de Python (python, senao py -3)
 REM     [NEW] --skip-tailscale / --gui / --no-gui
 REM     [NEW] mostra versao do main.py antes de subir
 REM ============================================================
@@ -49,7 +48,7 @@ exit /b 0
 :args_done
 
 echo ============================================================
-echo   BRN Node - CLIENTE (sincroniza da Maquina A) - v2
+echo   BRN Node - CLIENTE (sincroniza da Maquina A) - v3
 echo ============================================================
 echo.
 
@@ -80,12 +79,41 @@ echo.
 
 REM ============================================================
 REM  1) CARREGA brn_network.env  (ANTES do tailscale)
+REM     [v3] se faltar, cria com defaults e continua
 REM ============================================================
 if not exist "brn_network.env" (
-    echo [X] brn_network.env NAO existe
-    echo     Copie da Maquina A antes de continuar.
-    pause
-    exit /b 1
+    echo [!] brn_network.env nao existe - criando com defaults...
+    (
+        echo # ============================================================
+        echo # brn_network.env - Config do no CLIENTE
+        echo # ============================================================
+        echo # IMPORTANTE: BRN_NETWORK_SECRET e BRN_NODE_PASSWORD devem
+        echo # ser IGUAIS aos da Maquina A ^(origem^).
+        echo # ============================================================
+        echo.
+        echo BRN_NETWORK_SECRET=9226edea8ba62bc1c6ae36883c0536c95b4c85642195465d6c4d9456abef20f9
+        echo.
+        echo BRN_NODE_PASSWORD=senha-no-temp-123
+        echo BRN_WEB_PASS=senha-temp-123
+        echo BRN_WALLET_SESSION_PASS=senha-forte-da-carteira-2026
+        echo.
+        echo BRN_BOOTSTRAP_PEERS=192.168.0.19:6001
+        echo BRN_TRACKER=https://brn-tracker.onrender.com
+        echo.
+        echo BRN_IS_ORIGIN=0
+        echo BRN_HTTPS=0
+        echo BRN_AUDIT_ENABLED=1
+        echo BRN_AUDIT_LOG=audit.log
+        echo.
+        echo BRN_P2P_AUTH=optional
+        echo BRN_P2P_AUTH_WINDOW=30
+        echo BRN_P2P_NONCE_CACHE=10000
+        echo.
+        echo BRN_SKIP_VERIFY=0
+        echo BRN_VERIFY_STRICT=0
+    ) > brn_network.env
+    echo [ok] brn_network.env criado
+    echo     ^(edite para ajustar BRN_NETWORK_SECRET e BRN_BOOTSTRAP_PEERS^)
 )
 
 echo [*] Carregando brn_network.env...
@@ -102,7 +130,9 @@ for /f "usebackq eol=# tokens=1,* delims==" %%A in ("brn_network.env") do (
         REM Remove aspas simples no inicio/fim
         if "!V:~0,1!"=="'" set "V=!V:~1!"
         if "!V:~-1!"=="'" set "V=!V:~0,-1!"
-        set "!K!=!V!"
+        REM Remove espacos em volta do nome da variavel
+        for /f "tokens=* delims= " %%X in ("!K!") do set "K=%%X"
+        if not "!K!"=="" set "!K!=!V!"
     )
 )
 
@@ -112,14 +142,13 @@ echo.
 REM ============================================================
 REM  2) SENHAS LOCAIS (defaults se env nao definiu)
 REM ============================================================
-if "%BRN_NODE_PASSWORD%"==""      set "BRN_NODE_PASSWORD=senha-no-local-2026"
-if "%BRN_WEB_PASS%"==""           set "BRN_WEB_PASS=senha-carteira-2026"
-if "%BRN_WALLET_SESSION_PASS%"=="" set "BRN_WALLET_SESSION_PASS=%BRN_WEB_PASS%"
+if "%BRN_NODE_PASSWORD%"==""       set "BRN_NODE_PASSWORD=senha-no-temp-123"
+if "%BRN_WEB_PASS%"==""            set "BRN_WEB_PASS=senha-temp-123"
+if "%BRN_WALLET_SESSION_PASS%"=="" set "BRN_WALLET_SESSION_PASS=senha-forte-da-carteira-2026"
 
 REM ============================================================
 REM  3) PARAMETROS OPERACIONAIS
 REM ============================================================
-REM --- Lidos pelo main.py / miner_loop / network_guard ---
 if "%BRN_MINER_AUTO%"==""        set "BRN_MINER_AUTO=0"
 if "%BRN_MINER_INTERVAL%"==""    set "BRN_MINER_INTERVAL=30"
 if "%BRN_ALLOW_SOLO_MINING%"=="" set "BRN_ALLOW_SOLO_MINING=0"
@@ -132,16 +161,8 @@ if "%BRN_P2P_PORT%"==""          set "BRN_P2P_PORT=6001"
 if "%BRN_LOG_LEVEL%"==""         set "BRN_LOG_LEVEL=INFO"
 set "PYTHONUNBUFFERED=1"
 
-REM --- Reservadas (nao lidas por nenhum modulo revisado) ---
-REM set "BRN_NODE_AUTORESET=1"
-REM set "BRN_SYNC_BATCH=500"
-REM set "BRN_SYNC_PARALELO_MIN=500"
-REM set "BRN_SYNC_PARALELO_WORKERS=4"
-REM set "BRN_SYNC_RETRY_MAX=5"
-REM set "BRN_TCP_TIMEOUT=30.0"
-
 REM ============================================================
-REM  4) ARQUIVOS ESSENCIAIS (mesma lista do main.py)
+REM  4) ARQUIVOS ESSENCIAIS
 REM ============================================================
 set "FALTA="
 for %%F in (
@@ -214,7 +235,6 @@ if not "%BRN_BOOTSTRAP_PEERS%"=="" (
     echo [!] BRN_BOOTSTRAP_PEERS nao definido em brn_network.env
 )
 
-REM bootstrap_peers.json so e criado se voce usar esse formato
 if not "%BRN_BOOTSTRAP_FILE%"=="" (
     if not exist "%BRN_BOOTSTRAP_FILE%" (
         > "%BRN_BOOTSTRAP_FILE%" echo []
@@ -224,7 +244,7 @@ if not "%BRN_BOOTSTRAP_FILE%"=="" (
 echo.
 
 REM ============================================================
-REM  8) FINGERPRINT DO SEGREDO (via Python - nao interpola na shell)
+REM  8) FINGERPRINT DO SEGREDO
 REM ============================================================
 set "SEC_FP=(vazio)"
 if not "%BRN_NETWORK_SECRET%"=="" (
@@ -249,7 +269,6 @@ if "%FORCE_GUI%"=="1" (
     goto gui_done
 )
 
-REM No Windows, pywebview usa Edge/Chromium/MSHTML (nao GTK).
 %PY% -c "import webview" >nul 2>&1
 if errorlevel 1 (
     set "HEADLESS_FLAG=--headless"
