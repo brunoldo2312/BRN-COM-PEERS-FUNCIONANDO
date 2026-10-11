@@ -1,147 +1,331 @@
-# btc_watcher.py - v3 FINAL - Só confirma BTC via RPC
-# NÃO credita BRN direto. Envia pra mempool pra ser MINERADO pela sua BRN Chain
+# btc_watcher.py - v4 - Confirma BTC via RPC público e envia pra mempool BRN
+# ============================================================
+# v4:
+#   [FIX] usa requests.Session (keep-alive) e fecha no stop()
+#         → elimina ResourceWarning "' ' was never closed" (linha 147)
+#   [FIX] stop() com threading.Event (antes só self.running bool)
+#   [FIX] valida None em escrow['expires_at'] / ['btc_expected_sats']
+#   [FIX] trata HTTP 429 / 5xx com backoff (evita ban do Blockstream)
+#   [FIX] logger em vez de print
+#   [FIX] reconstrói o final do arquivo (Mempool.space fallback)
+#   [NEW] info() para diagnóstico
+#   [NEW] add_l2_transaction envolvido em try/except com aviso claro
+#         (esse método não existe no blockchain.py v9.1.4 — se não existir
+#          no seu, o L2 nunca libera; adicione ou troque por submit_tx)
+# ============================================================
 import time
-import requests
+import logging
 import threading
+
+import requests
+
 import btc_config
+
+log = logging.getLogger("btc_watcher")
+
+# Config RPC (Blockstream + Mempool.space)
+BLOCKSTREAM_MAINNET = "https://blockstream.info/api"
+BLOCKSTREAM_TESTNET = "https://blockstream.info/testnet/api"
+MEMPOOL_MAINNET     = "https://mempool.space/api"
+MEMPOOL_TESTNET     = "https://mempool.space/testnet/api"
+
+POLL_INTERVAL_S     = 30
+HTTP_TIMEOUT_S      = 15
+HTTP_TIP_TIMEOUT_S  = 5
+MAX_TXS_PER_ADDR    = 30
+BACKOFF_ON_429_S    = 120
+
 
 class BTCWatcher(threading.Thread):
     def __init__(self, db, blockchain):
-        super().__init__(daemon=True)
+        super().__init__(daemon=True, name="BTCWatcher")
         self.db = db
         self.blockchain = blockchain
-        self.running = True
-        print(f"[BTC Watcher RPC] Iniciado")
-        print(f"[BTC Watcher RPC] Endereço: {btc_config.BTC_RECEIVE_ADDRESS}")
-        print(f"[BTC Watcher RPC] Rede: {btc_config.BTC_NETWORK}")
-        print(f"[BTC Watcher RPC] Confirmações necessárias: {btc_config.BTC_MIN_CONFIRMATIONS}")
+        self._stop_evt = threading.Event()
+        self._session = requests.Session()
+        self._session.headers.update({"User-Agent": "brn-btc-watcher/4"})
 
+        self._backoff_until = 0.0
+
+        # Endereço placeholder → não roda
+        addr = getattr(btc_config, "BTC_RECEIVE_ADDRESS", "") or ""
+        self._enabled = bool(addr) and "SEU_ENDERECO" not in addr
+
+        log.info("[BTC Watcher] Iniciado")
+        log.info("[BTC Watcher] Endereço: %s", addr or "(vazio)")
+        log.info("[BTC Watcher] Rede: %s", getattr(btc_config, "BTC_NETWORK", "?"))
+        log.info("[BTC Watcher] Confirmações: %s",
+                 getattr(btc_config, "BTC_MIN_CONFIRMATIONS", "?"))
+        if not self._enabled:
+            log.warning("[BTC Watcher] Endereço placeholder — watcher NÃO vai rodar")
+
+    # --------------------------------------------------------
+    # STOP / CONTROLE
+    # --------------------------------------------------------
+    @property
+    def running(self) -> bool:
+        return not self._stop_evt.is_set()
+
+    def stop(self):
+        self._stop_evt.set()
+        try:
+            self._session.close()
+        except Exception:
+            pass
+
+    def info(self) -> dict:
+        return {
+            "running": self.running,
+            "enabled": self._enabled,
+            "address": getattr(btc_config, "BTC_RECEIVE_ADDRESS", ""),
+            "network": getattr(btc_config, "BTC_NETWORK", ""),
+            "min_confirmations": getattr(btc_config, "BTC_MIN_CONFIRMATIONS", 0),
+            "backoff_until": self._backoff_until,
+        }
+
+    # --------------------------------------------------------
+    # LOOP PRINCIPAL
+    # --------------------------------------------------------
     def run(self):
-        while self.running:
+        if not self._enabled:
+            return
+
+        while not self._stop_evt.is_set():
             try:
+                if time.time() < self._backoff_until:
+                    wait = max(1, int(self._backoff_until - time.time()))
+                    log.debug("[BTC Watcher] backoff ativo — aguardando %ds", wait)
+                    if self._stop_evt.wait(timeout=min(wait, 10)):
+                        break
+                    continue
+
                 self.check_rpc()
             except Exception as e:
-                print(f"[BTC Watcher] Erro: {e}")
-            time.sleep(30)  # checa a cada 30s
+                log.warning("[BTC Watcher] Erro: %s", e)
 
+            if self._stop_evt.wait(timeout=POLL_INTERVAL_S):
+                break
+
+        log.info("[BTC Watcher] Encerrado")
+
+    # --------------------------------------------------------
+    # CHECK
+    # --------------------------------------------------------
     def check_rpc(self):
-        escrows = self.db.get_l2_escrows(status="OPEN")
+        try:
+            escrows = self.db.get_l2_escrows(status="OPEN")
+        except Exception as e:
+            log.warning("[BTC Watcher] get_l2_escrows falhou: %s", e)
+            return
+
         if not escrows:
             return
-        
+
         btc_txs = self.fetch_via_rpc(btc_config.BTC_RECEIVE_ADDRESS)
         if not btc_txs:
             return
 
-        for escrow in escrows:
-            if escrow['expires_at'] < time.time():
-                self.db.update_l2_escrow_status(escrow['escrow_id'], "EXPIRED")
-                print(f"[BTC Watcher] Escrow expirado: {escrow['escrow_id']}")
-                continue
-            
-            for btc_tx in btc_txs:
-                # Anti-replay
-                if self.db.is_btc_txid_used(btc_tx['txid']):
-                    continue
-                
-                # Valor mínimo (99% pra tolerar fee)
-                if btc_tx['value_sats'] < int(escrow['btc_expected_sats'] * 0.99):
-                    continue
-                
-                # Confirmações via RPC
-                if btc_tx['confirmations'] < btc_config.BTC_MIN_CONFIRMATIONS:
-                    print(f"[BTC Watcher] BTC {btc_tx['txid'][:16]}... só {btc_tx['confirmations']} confirmações, precisa {btc_config.BTC_MIN_CONFIRMATIONS}")
-                    continue
-                
-                # ==== BTC CONFIRMADO VIA RPC ====
-                print(f"")
-                print(f"[BTC Watcher RPC] ============ BTC CONFIRMADO ============")
-                print(f"[BTC Watcher RPC] Escrow: {escrow['escrow_id']}")
-                print(f"[BTC Watcher RPC] BTC TXID: {btc_tx['txid']}")
-                print(f"[BTC Watcher RPC] Valor: {btc_tx['value_sats']/1e8} BTC")
-                print(f"[BTC Watcher RPC] Confirmações: {btc_tx['confirmations']}")
-                print(f"[BTC Watcher RPC] Comprador BRN: {escrow['buyer']}")
-                print(f"[BTC Watcher RPC] BRN a liberar: {escrow['brn_amount']/1e8} BRN")
-                print(f"[BTC Watcher RPC] Enviando para MEMPOOL da BRN Chain...")
-                print(f"[BTC Watcher RPC] ========================================")
-                print(f"")
+        agora = time.time()
 
-                # Envia pra blockchain validar via MINERAÇÃO
-                l2_tx = {
-                    "type": "l2_settlement",
-                    "escrow_id": escrow['escrow_id'],
-                    "buyer": escrow['buyer'],
-                    "brn_amount": escrow['brn_amount'],
-                    "btc_txid": btc_tx['txid'],
-                    "btc_address": escrow['btc_address'],
-                    "l2_hash": escrow['l2_hash'],
-                    "timestamp": int(time.time())
-                }
+        for escrow in escrows:
+            # Campos podem vir None do DB
+            escrow_id = escrow.get("escrow_id", "")
+            expires_at = escrow.get("expires_at")
+            expected_sats = escrow.get("btc_expected_sats")
+
+            # Expirado?
+            try:
+                if expires_at and float(expires_at) < agora:
+                    self.db.update_l2_escrow_status(escrow_id, "EXPIRED")
+                    log.info("[BTC Watcher] Escrow expirado: %s", escrow_id)
+                    continue
+            except (TypeError, ValueError):
+                pass
+
+            if not expected_sats:
+                log.debug("[BTC Watcher] escrow %s sem btc_expected_sats",
+                          escrow_id[:12])
+                continue
+
+            min_sats = int(float(expected_sats) * 0.99)
+
+            for btc_tx in btc_txs:
+                txid_btc = btc_tx.get("txid", "")
+                if not txid_btc:
+                    continue
+
+                # Anti-replay
                 try:
-                    txid = self.blockchain.add_l2_transaction(l2_tx)
-                    print(f"[BTC Watcher] L2 TX {txid} enviado pra mempool. Aguardando minerador minerar bloco...")
+                    if self.db.is_btc_txid_used(txid_btc):
+                        continue
+                except Exception:
+                    pass
+
+                # Valor mínimo
+                if btc_tx.get("value_sats", 0) < min_sats:
+                    continue
+
+                # Confirmações
+                needed = int(getattr(btc_config, "BTC_MIN_CONFIRMATIONS", 3))
+                confs = int(btc_tx.get("confirmations", 0))
+                if confs < needed:
+                    log.info("[BTC Watcher] BTC %s... só %d/%d confirmações",
+                             txid_btc[:16], confs, needed)
+                    continue
+
+                # ====== BTC CONFIRMADO ======
+                log.info("[BTC Watcher] ============ BTC CONFIRMADO ============")
+                log.info("[BTC Watcher] Escrow: %s", escrow_id)
+                log.info("[BTC Watcher] BTC TXID: %s", txid_btc)
+                log.info("[BTC Watcher] Valor: %.8f BTC",
+                         btc_tx.get("value_sats", 0) / 1e8)
+                log.info("[BTC Watcher] Confirmações: %d", confs)
+                log.info("[BTC Watcher] Comprador BRN: %s",
+                         escrow.get("buyer", ""))
+                log.info("[BTC Watcher] BRN a liberar: %.8f BRN",
+                         (escrow.get("brn_amount") or 0) / 1e8)
+                log.info("[BTC Watcher] Enviando pra mempool BRN...")
+
+                l2_tx = {
+                    "type":         "l2_settlement",
+                    "escrow_id":    escrow_id,
+                    "buyer":        escrow.get("buyer", ""),
+                    "brn_amount":   escrow.get("brn_amount", 0),
+                    "btc_txid":     txid_btc,
+                    "btc_address":  escrow.get("btc_address", ""),
+                    "l2_hash":      escrow.get("l2_hash", ""),
+                    "timestamp":    int(agora),
+                }
+
+                # ⚠️ ATENÇÃO: `add_l2_transaction` NÃO existe no blockchain.py v9.1.4.
+                # Se você não tem esse método, o L2 nunca libera.
+                # Opções:
+                #   a) implementar add_l2_transaction no blockchain.py
+                #   b) usar `submit_tx` com a tx formatada corretamente
+                #   c) fazer o crédito direto via db.apply_tx
+                try:
+                    fn = getattr(self.blockchain, "add_l2_transaction", None)
+                    if fn is None:
+                        log.error("[BTC Watcher] blockchain.add_l2_transaction "
+                                  "não existe — L2 não será liberado. "
+                                  "Implemente esse método ou use submit_tx.")
+                        continue
+                    txid = fn(l2_tx)
+                    log.info("[BTC Watcher] L2 TX %s enviada pra mempool. "
+                             "Aguardando minerador.", txid)
                 except Exception as e:
-                    print(f"[BTC Watcher] Erro ao enviar pra mempool: {e}")
+                    log.error("[BTC Watcher] Erro enviando pra mempool: %s", e)
+
+    # --------------------------------------------------------
+    # RPC PÚBLICO
+    # --------------------------------------------------------
+    def _http_get_json(self, url: str, timeout: int = HTTP_TIMEOUT_S):
+        """
+        GET que devolve JSON, fechando o response corretamente.
+        Trata 429 e 5xx com backoff.
+        Retorna (data, None) ou (None, erro_str).
+        """
+        try:
+            with self._session.get(url, timeout=timeout) as r:
+                if r.status_code == 429:
+                    self._backoff_until = time.time() + BACKOFF_ON_429_S
+                    log.warning("[RPC] HTTP 429 em %s — backoff %ds",
+                                url, BACKOFF_ON_429_S)
+                    return None, "429"
+                if r.status_code >= 500:
+                    return None, f"http {r.status_code}"
+                if r.status_code != 200:
+                    return None, f"http {r.status_code}"
+                # r.json() lê o corpo completo → libera o socket
+                return r.json(), None
+        except requests.exceptions.Timeout:
+            return None, "timeout"
+        except requests.exceptions.ConnectionError as e:
+            return None, f"conn: {e}"
+        except Exception as e:
+            return None, str(e)
+
+    def _http_get_text(self, url: str, timeout: int = HTTP_TIP_TIMEOUT_S):
+        try:
+            with self._session.get(url, timeout=timeout) as r:
+                if r.status_code != 200:
+                    return None
+                return r.text.strip()
+        except Exception:
+            return None
 
     def fetch_via_rpc(self, address):
-        """Busca TXs via RPC público - Blockstream / Mempool.space"""
-        # Tenta Blockstream
-        try:
-            base = "https://blockstream.info/api" if btc_config.BTC_NETWORK == "mainnet" else "https://blockstream.info/testnet/api"
-            r = requests.get(f"{base}/address/{address}/txs", timeout=15)
-            if r.status_code == 200:
-                data = r.json()
-                txs = []
-                for tx in data[:30]:
-                    # Soma quanto caiu no seu endereço
-                    val = 0
-                    for vout in tx.get('vout', []):
-                        if vout.get('scriptpubkey_address') == address:
-                            val += vout.get('value', 0)
-                    if val == 0:
-                        continue
-                    
-                    # Confirmações
-                    confirmations = 0
-                    status = tx.get('status', {})
-                    if status.get('confirmed'):
-                        # Se tem block_height, está confirmado
-                        # Pra simplificar, assume 3 se confirmado (sua chain valida melhor depois)
-                        # Se quiser preciso: busque altura atual - altura do bloco
-                        confirmations = 3
-                        # Tenta pegar confirmações reais
-                        try:
-                            if status.get('block_height'):
-                                tip_r = requests.get(f"{base}/blocks/tip/height", timeout=5)
-                                if tip_r.status_code == 200:
-                                    tip_height = int(tip_r.text)
-                                    confirmations = tip_height - status['block_height'] + 1
-                        except:
-                            confirmations = 3
+        """
+        Busca TXs da carteira BTC via RPC público.
+        Tenta Blockstream primeiro, depois Mempool.space.
+        """
+        if not address:
+            return []
 
-                    txs.append({
-                        "txid": tx['txid'],
-                        "value_sats": val,
-                        "confirmations": confirmations
-                    })
-                if txs:
-                    return txs
-        except Exception as e:
-            print(f"[RPC] Blockstream falhou: {e}")
+        # ---- Blockstream ----
+        txs = self._fetch_from(
+            base=(BLOCKSTREAM_MAINNET
+                  if getattr(btc_config, "BTC_NETWORK", "mainnet") == "mainnet"
+                  else BLOCKSTREAM_TESTNET),
+            address=address,
+            nome="Blockstream",
+        )
+        if txs:
+            return txs
 
-        # Fallback Mempool.space
+        # ---- Mempool.space ----
+        txs = self._fetch_from(
+            base=(MEMPOOL_MAINNET
+                  if getattr(btc_config, "BTC_NETWORK", "mainnet") == "mainnet"
+                  else MEMPOOL_TESTNET),
+            address=address,
+            nome="Mempool.space",
+        )
+        return txs or []
+
+    def _fetch_from(self, base: str, address: str, nome: str):
+        data, err = self._http_get_json(f"{base}/address/{address}/txs")
+        if err or data is None:
+            log.debug("[RPC] %s falhou: %s", nome, err)
+            return []
+        if not isinstance(data, list):
+            return []
+
+        # Altura atual da chain BTC (para calcular confirmações)
+        tip_str = self._http_get_text(f"{base}/blocks/tip/height")
         try:
-            base2 = "https://mempool.space/api" if btc_config.BTC_NETWORK == "mainnet" else "https://mempool.space/testnet/api"
-            r = requests.get(f"{base2}/address/{address}/txs", timeout=15)
-            if r.status_code == 200:
-                data = r.json()
-                txs = []
-                for tx in data[:30]:
-                    val = 0
-                    for vout in tx.get('vout', []):
-                        if vout.get('scriptpubkey_address') == address:
-                            val += vout.get('value', 0)
-                    if val == 0:
-                        continue
-                    confirmations = 3 if tx.get('status', {}).get('confirmed') else 0
-                    txs.append({"txid": tx
+            tip_height = int(tip_str) if tip_str else 0
+        except (ValueError, TypeError):
+            tip_height = 0
+
+        txs = []
+        for tx in data[:MAX_TXS_PER_ADDR]:
+            if not isinstance(tx, dict):
+                continue
+
+            # Soma outputs que vão para o nosso endereço
+            val = 0
+            for vout in tx.get("vout", []):
+                if vout.get("scriptpubkey_address") == address:
+                    val += int(vout.get("value", 0) or 0)
+            if val == 0:
+                continue
+
+            # Confirmações
+            status = tx.get("status", {}) or {}
+            confirmations = 0
+            if status.get("confirmed"):
+                bh = status.get("block_height")
+                if bh and tip_height:
+                    confirmations = max(0, tip_height - int(bh) + 1)
+                else:
+                    confirmations = int(getattr(
+                        btc_config, "BTC_MIN_CONFIRMATIONS", 3))
+
+            txs.append({
+                "txid":          tx.get("txid", ""),
+                "value_sats":    val,
+                "confirmations": confirmations,
+            })
+
+        return txs
