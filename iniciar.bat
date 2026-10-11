@@ -1,171 +1,331 @@
 @echo off
-chcp 65001 >nul
+REM ============================================================
+REM   iniciar.bat - BRN Node CLIENTE (Windows) - v2
+REM ============================================================
+REM   Equivalente ao iniciar.sh do Linux/Mac.
+REM   ASCII only (sem acentos).
+REM
+REM   v2:
+REM     [FIX] carrega brn_network.env ANTES do tailscale
+REM     [FIX] passa --no-tailscale pro main.py (evita setup 2x)
+REM     [FIX] checa TODOS os modulos obrigatorios
+REM     [FIX] parser de env trata comentarios (eol=#)
+REM     [FIX] fingerprint via Python (nao interpola na shell)
+REM     [FIX] bootstrap_peers.json sem IP hardcoded
+REM     [FIX] deteccao de Python (python, senao py -3)
+REM     [NEW] --skip-tailscale / --gui / --no-gui
+REM     [NEW] mostra versao do main.py antes de subir
+REM ============================================================
+
 setlocal EnableDelayedExpansion
+
+REM -------- Diretorio do script --------
 cd /d "%~dp0"
-
-REM ============================================================
-REM   iniciar_cliente.bat — BRN Node (Windows, modo CLIENTE)
-REM ------------------------------------------------------------
-REM   Configura automaticamente:
-REM     - BRN_NETWORK_SECRET (o mesmo da Maquina A/Ubuntu)
-REM     - BRN_BOOTSTRAP_PEERS (IP da Maquina A)
-REM     - BRN_NODE_PASSWORD   (identidade Ed25519)
-REM     - BRN_WEB_PASS        (carteira)
-REM   E roda: python main.py --client-mode
-REM ============================================================
-
-echo.
-echo ============================================================
-echo   BRN Node - Windows (modo CLIENTE)
-echo ============================================================
-echo.
-
-REM ============================================================
-REM   CONFIGURACOES - AJUSTE SE NECESSARIO
-REM ============================================================
-set "BRN_NODE_PASSWORD=senha-no-temp-123"
-set "BRN_WEB_PASS=senha-temp-123"
-set "BRN_NETWORK_SECRET=9226edea8ba62bc1c6ae36883c0536c95b4c85642195465d6c4d9456abef20f9"
-set "BRN_BOOTSTRAP_PEERS=192.168.0.19:6001"
-
-REM ============================================================
-REM   1) Confirma que esta na pasta correta
-REM ============================================================
-if not exist "main.py" (
-    echo [X] main.py nao encontrado nesta pasta.
-    echo     Este .bat precisa estar na mesma pasta que main.py
-    echo     Pasta atual: %CD%
-    echo.
-    pause
-    exit /b 1
-)
-
-if not exist "p2p_unified.py" (
-    echo [X] p2p_unified.py nao encontrado.
-    echo     Arquivos do projeto incompletos.
-    pause
-    exit /b 1
-)
-
-echo [ok] Pasta correta: %CD%
-echo.
-
-REM ============================================================
-REM   2) Verifica Python
-REM ============================================================
-where python >nul 2>nul
 if errorlevel 1 (
-    echo [X] Python nao encontrado no PATH.
-    echo     Instale em https://python.org ^(marque "Add to PATH"^)
+    echo [X] Nao consegui cd para %~dp0
     pause
     exit /b 1
 )
-for /f "tokens=2" %%i in ('python --version 2^>^&1') do set "PYVER=%%i"
-echo [ok] Python !PYVER!
+
+REM -------- Argumentos --------
+set "SKIP_TAILSCALE=0"
+set "FORCE_GUI=0"
+set "FORCE_NO_GUI=0"
+
+:parse_args
+if "%~1"=="" goto args_done
+if /i "%~1"=="--skip-tailscale" set "SKIP_TAILSCALE=1"
+if /i "%~1"=="--gui"            set "FORCE_GUI=1"
+if /i "%~1"=="--no-gui"         set "FORCE_NO_GUI=1"
+if /i "%~1"=="-h"               goto show_help
+if /i "%~1"=="--help"           goto show_help
+shift
+goto parse_args
+
+:show_help
+echo Uso: iniciar.bat [--skip-tailscale] [--gui] [--no-gui]
+exit /b 0
+
+:args_done
+
+echo ============================================================
+echo   BRN Node - CLIENTE (sincroniza da Maquina A) - v2
+echo ============================================================
 echo.
 
 REM ============================================================
-REM   3) Exporta as variaveis (o Python le via os.environ)
+REM  0) PYTHON
 REM ============================================================
+set "PY="
+where python >nul 2>&1
+if not errorlevel 1 set "PY=python"
+
+if "%PY%"=="" (
+    where py >nul 2>&1
+    if not errorlevel 1 set "PY=py -3"
+)
+
+if "%PY%"=="" (
+    echo [X] Python 3 nao encontrado
+    echo     Instale: https://www.python.org/downloads/
+    echo     Marque "Add Python to PATH" na instalacao.
+    pause
+    exit /b 1
+)
+
+set "PYVER=?"
+for /f "tokens=*" %%V in ('%PY% -c "import sys;print(sys.version.split()[0])" 2^>nul') do set "PYVER=%%V"
+echo [ok] Python %PYVER% ^(%PY%^)
+echo.
+
+REM ============================================================
+REM  1) CARREGA brn_network.env  (ANTES do tailscale)
+REM ============================================================
+if not exist "brn_network.env" (
+    echo [X] brn_network.env NAO existe
+    echo     Copie da Maquina A antes de continuar.
+    pause
+    exit /b 1
+)
+
+echo [*] Carregando brn_network.env...
+
+REM eol=# trata linhas iniciadas por # como comentario.
+REM tokens=1,* com delims== divide em K=V (primeiro = define o corte).
+for /f "usebackq eol=# tokens=1,* delims==" %%A in ("brn_network.env") do (
+    set "K=%%A"
+    set "V=%%B"
+    if not "!K!"=="" (
+        REM Remove aspas duplas no inicio/fim
+        if "!V:~0,1!"=="""" set "V=!V:~1!"
+        if "!V:~-1!"=="""" set "V=!V:~0,-1!"
+        REM Remove aspas simples no inicio/fim
+        if "!V:~0,1!"=="'" set "V=!V:~1!"
+        if "!V:~-1!"=="'" set "V=!V:~0,-1!"
+        set "!K!=!V!"
+    )
+)
+
+echo [ok] brn_network.env carregado
+echo.
+
+REM ============================================================
+REM  2) SENHAS LOCAIS (defaults se env nao definiu)
+REM ============================================================
+if "%BRN_NODE_PASSWORD%"==""      set "BRN_NODE_PASSWORD=senha-no-local-2026"
+if "%BRN_WEB_PASS%"==""           set "BRN_WEB_PASS=senha-carteira-2026"
+if "%BRN_WALLET_SESSION_PASS%"=="" set "BRN_WALLET_SESSION_PASS=%BRN_WEB_PASS%"
+
+REM ============================================================
+REM  3) PARAMETROS OPERACIONAIS
+REM ============================================================
+REM --- Lidos pelo main.py / miner_loop / network_guard ---
+if "%BRN_MINER_AUTO%"==""        set "BRN_MINER_AUTO=0"
+if "%BRN_MINER_INTERVAL%"==""    set "BRN_MINER_INTERVAL=30"
+if "%BRN_ALLOW_SOLO_MINING%"=="" set "BRN_ALLOW_SOLO_MINING=0"
+if "%BRN_MIN_PEER_STABLE%"==""   set "BRN_MIN_PEER_STABLE=1"
+if "%BRN_UPNP%"==""              set "BRN_UPNP=1"
+if "%BRN_P2P_AUTH%"==""          set "BRN_P2P_AUTH=optional"
+if "%BRN_WEB_PORT%"==""          set "BRN_WEB_PORT=5000"
+if "%BRN_EXPLORER_PORT%"==""     set "BRN_EXPLORER_PORT=8080"
+if "%BRN_P2P_PORT%"==""          set "BRN_P2P_PORT=6001"
+if "%BRN_LOG_LEVEL%"==""         set "BRN_LOG_LEVEL=INFO"
 set "PYTHONUNBUFFERED=1"
 
-echo [i] Configuracao:
-echo     NODE_PASSWORD       = !BRN_NODE_PASSWORD!
-echo     WEB_PASS            = !BRN_WEB_PASS!
-echo     NETWORK_SECRET      = !BRN_NETWORK_SECRET:~0,16!...
-echo     BOOTSTRAP_PEERS     = !BRN_BOOTSTRAP_PEERS!
-echo.
+REM --- Reservadas (nao lidas por nenhum modulo revisado) ---
+REM set "BRN_NODE_AUTORESET=1"
+REM set "BRN_SYNC_BATCH=500"
+REM set "BRN_SYNC_PARALELO_MIN=500"
+REM set "BRN_SYNC_PARALELO_WORKERS=4"
+REM set "BRN_SYNC_RETRY_MAX=5"
+REM set "BRN_TCP_TIMEOUT=30.0"
 
 REM ============================================================
-REM   4) Apaga node_identity.enc antigo (evita "senha errada")
+REM  4) ARQUIVOS ESSENCIAIS (mesma lista do main.py)
 REM ============================================================
-if exist "node_identity.enc" (
-    echo [i] Removendo node_identity.enc antigo ^(sera recriado^)...
-    del /q "node_identity.enc" 2>nul
-    del /q "node_identity.enc.bak" 2>nul
-    del /q "node_identity.enc.antiga" 2>nul
-    del /q "node_identity.enc.corrompida_*" 2>nul
-    echo [ok] Removido
-    echo.
+set "FALTA="
+for %%F in (
+    main.py server.py explorer.py
+    blockchain.py db.py crypto.py wallet.py
+    chain_validator.py checkpoints.py
+    brn_config.py brn_logger.py version.py
+    security.py secure_store.py
+    p2p_unified.py p2p_auth.py p2p_secure.py p2p_cipher.py p2p_relay.py
+    discovery_v2.py rendezvous_discovery.py network_guard.py
+    miner_loop.py update_peers.py bech32.py
+) do (
+    if not exist "%%F" set "FALTA=!FALTA! %%F"
 )
 
-REM ============================================================
-REM   5) Atualiza bootstrap_peers.json (para o P2P achar a Maquina A)
-REM ============================================================
-echo [i] Atualizando bootstrap_peers.json...
-> "bootstrap_peers.json" echo ["!BRN_BOOTSTRAP_PEERS!"]
-echo [ok] bootstrap_peers.json = ["!BRN_BOOTSTRAP_PEERS!"]
+if not "%FALTA%"=="" (
+    echo [X] Arquivos faltando:%FALTA%
+    pause
+    exit /b 1
+)
+echo [ok] Arquivos essenciais OK
 echo.
 
 REM ============================================================
-REM   6) Atualiza brn_network.env (para o main.py carregar)
+REM  5) PAPEL: CLIENTE
 REM ============================================================
-echo [i] Atualizando brn_network.env...
-> "brn_network.env" echo BRN_NETWORK_SECRET=!BRN_NETWORK_SECRET!
->>"brn_network.env" echo BRN_TRACKER=https://brn-tracker.onrender.com
->>"brn_network.env" echo BRN_BOOTSTRAP_PEERS=!BRN_BOOTSTRAP_PEERS!
-echo [ok] brn_network.env atualizado
+> "brn_role.txt" echo client
+echo [ok] Papel: cliente (nao origina genesis)
 echo.
 
 REM ============================================================
-REM   7) Testa se a Maquina A (Ubuntu) esta respondendo
+REM  6) TAILSCALE (opcional - DEPOIS do env)
 REM ============================================================
-echo [i] Testando conexao com !BRN_BOOTSTRAP_PEERS!...
-for /f "tokens=1,2 delims=:" %%a in ("!BRN_BOOTSTRAP_PEERS!") do (
-    set "_HOST=%%a"
-    set "_PORT=%%b"
+set "TAILSCALE_FLAG=--no-tailscale"
+
+if "%SKIP_TAILSCALE%"=="1" (
+    echo [*] Tailscale: pulado ^(--skip-tailscale^)
+    goto tailscale_done
 )
 
-REM Extrai so o IP (remove http:// se houver)
-set "_HOST=! _HOST:http://=!"
-set "_HOST=!_HOST:https://=!"
+if not exist "brn_tailscale_setup.py" (
+    echo [*] brn_tailscale_setup.py nao encontrado. Pulando.
+    goto tailscale_done
+)
 
-powershell -NoProfile -Command ^
-    "$r = Test-NetConnection -ComputerName !_HOST! -Port !_PORT! -WarningAction SilentlyContinue; if ($r.TcpTestSucceeded) { exit 0 } else { exit 1 }" >nul 2>nul
+if "%TS_AUTH_KEY%"=="" (
+    echo [*] TS_AUTH_KEY vazia. Pulando Tailscale.
+    goto tailscale_done
+)
 
+echo [*] Configurando Tailscale...
+%PY% brn_tailscale_setup.py --auto >nul 2>&1
 if errorlevel 1 (
-    echo [!] Nao consegui alcancar !BRN_BOOTSTRAP_PEERS!
-    echo     Verifique:
-    echo       - A Maquina A ^(Ubuntu^) esta rodando?
-    echo       - O IP !_HOST! esta correto?
-    echo       - Firewall da Ubuntu liberou porta 6001?
-    echo.
-    echo     Continuando mesmo assim ^(o main.py tentara sync sozinho^)...
-    echo.
+    echo [!] Tailscale nao esta pronto.
+    echo     Para configurar agora: %PY% brn_tailscale_setup.py
+    echo     Continuando sem Tailscale...
 ) else (
-    echo [ok] Maquina A acessivel na porta !_PORT!
-    echo.
+    echo [ok] Tailscale OK
+)
+
+:tailscale_done
+echo.
+
+REM ============================================================
+REM  7) BOOTSTRAP PEERS
+REM ============================================================
+if not "%BRN_BOOTSTRAP_PEERS%"=="" (
+    echo [ok] BRN_BOOTSTRAP_PEERS = %BRN_BOOTSTRAP_PEERS%
+) else (
+    echo [!] BRN_BOOTSTRAP_PEERS nao definido em brn_network.env
+)
+
+REM bootstrap_peers.json so e criado se voce usar esse formato
+if not "%BRN_BOOTSTRAP_FILE%"=="" (
+    if not exist "%BRN_BOOTSTRAP_FILE%" (
+        > "%BRN_BOOTSTRAP_FILE%" echo []
+        echo [ok] %BRN_BOOTSTRAP_FILE% criado ^(vazio^)
+    )
+)
+echo.
+
+REM ============================================================
+REM  8) FINGERPRINT DO SEGREDO (via Python - nao interpola na shell)
+REM ============================================================
+set "SEC_FP=(vazio)"
+if not "%BRN_NETWORK_SECRET%"=="" (
+    for /f "tokens=*" %%H in ('%PY% -c "import hashlib,os;print(hashlib.sha256(os.environ.get('BRN_NETWORK_SECRET','').encode()).hexdigest()[:16])" 2^>nul') do (
+        set "SEC_FP=%%H"
+    )
 )
 
 REM ============================================================
-REM   8) Inicia o no
+REM  9) PYWEBVIEW (GUI ou headless)
+REM ============================================================
+set "HEADLESS_FLAG="
+
+if "%FORCE_NO_GUI%"=="1" (
+    set "HEADLESS_FLAG=--headless"
+    echo [*] GUI desabilitada por --no-gui
+    goto gui_done
+)
+
+if "%FORCE_GUI%"=="1" (
+    echo [ok] GUI forcada por --gui
+    goto gui_done
+)
+
+REM No Windows, pywebview usa Edge/Chromium/MSHTML (nao GTK).
+%PY% -c "import webview" >nul 2>&1
+if errorlevel 1 (
+    set "HEADLESS_FLAG=--headless"
+    echo [!] pywebview ausente - modo HEADLESS
+    echo     Para instalar GUI: %PY% -m pip install pywebview
+    goto gui_done
+)
+
+echo [ok] pywebview OK - carteira desktop vai abrir
+
+:gui_done
+
+set "GUI_STATUS=GUI"
+if "%HEADLESS_FLAG%"=="--headless" set "GUI_STATUS=HEADLESS"
+echo.
+
+REM ============================================================
+REM 10) VERSAO DO main.py
+REM ============================================================
+set "NODE_VERSION=?"
+for /f "tokens=*" %%V in ('%PY% main.py --version 2^>nul') do set "NODE_VERSION=%%V"
+echo [ok] main.py versao: %NODE_VERSION%
+echo.
+
+REM ============================================================
+REM 11) RESUMO
 REM ============================================================
 echo ============================================================
-echo   Iniciando BRN Node em modo CLIENTE
+echo   CONFIGURACAO ATUAL (CLIENTE)
 echo ============================================================
-echo   Ctrl+C para encerrar
+echo   Modo       : CLIENTE (sincroniza da rede)
+echo   Versao     : %NODE_VERSION%
+echo   Auth FP    : %SEC_FP%...  ^<- deve ser IGUAL ao da Maquina A
+echo   Tracker    : %BRN_TRACKER%
+echo   Bootstrap  : %BRN_BOOTSTRAP_PEERS%
+echo   Mineracao  : %BRN_MINER_AUTO% (pode ativar na carteira)
+echo   P2P porta  : %BRN_P2P_PORT%
+echo   HTTP       : http://127.0.0.1:%BRN_WEB_PORT%
+echo   Explorer   : http://127.0.0.1:%BRN_EXPLORER_PORT%
+echo   Python     : %PYVER%
+echo   pywebview  : %GUI_STATUS%
+echo   Tailscale  : %TAILSCALE_FLAG%
+echo ============================================================
+echo.
+echo   ATENCAO: deixe esta janela ABERTA enquanto o cliente roda.
 echo.
 
-python main.py --client-mode
+REM ============================================================
+REM 12) INICIA O NO EM MODO CLIENTE
+REM ============================================================
+echo [*] Iniciando CLIENTE BRN... ^(Ctrl+C para encerrar^)
+echo.
 
-set "EXITCODE=!ERRORLEVEL!"
+%PY% main.py --client-mode %TAILSCALE_FLAG% %HEADLESS_FLAG%
+set "EXITCODE=%ERRORLEVEL%"
 
 echo.
-echo ============================================================
-if !EXITCODE! neq 0 (
-    echo   [X] O no saiu com codigo !EXITCODE!
+if not "%EXITCODE%"=="0" (
+    echo [X] O no saiu com codigo %EXITCODE%
     echo.
-    echo   Diagnostico:
-    echo     - Se erro foi "falha ao decifrar", rode novamente
-    echo       ^(o .bat apaga a identidade automaticamente^)
-    echo     - Se travou em "Aguardando genesis", verifique
-    echo       se a Maquina A ^(Ubuntu^) esta rodando
+    echo   Se o erro foi 'Falha ao decifrar node_identity.enc':
+    echo     del node_identity.enc
+    echo     iniciar.bat
+    echo.
+    echo   Se o erro foi 'TIMEOUT esperando genesis':
+    echo     - Verifique se a Maquina A esta rodando
+    echo     - Verifique se as duas estao na mesma rede/Tailscale
+    echo     - Verifique se os segredos batem: type brn_network.env
+    echo.
+    echo   Se o erro foi 'Modulos obrigatorios faltando':
+    echo     Rode: %PY% verify.py
     echo.
 ) else (
-    echo   [ok] No encerrado normalmente.
+    echo [ok] No encerrado normalmente.
 )
-echo ============================================================
+
 echo.
 pause
-endlocal
-exit /b !EXITCODE!
+exit /b %EXITCODE%
